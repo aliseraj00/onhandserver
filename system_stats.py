@@ -8,6 +8,13 @@ import psutil
 
 
 @dataclass
+class ProcessUsage:
+    name: str
+    pid: int
+    value: float
+
+
+@dataclass
 class ResourceSnapshot:
     cpu_percent_per_core: list[float]
     cpu_percent_avg: float
@@ -24,11 +31,55 @@ class ResourceSnapshot:
     hostname: str
     load_avg: tuple[float, float, float] | None
     uptime_seconds: float
+    top_ram_processes: list[ProcessUsage]
+    top_cpu_processes: list[ProcessUsage]
+
+
+def _prime_process_cpu() -> list[psutil.Process]:
+    tracked: list[psutil.Process] = []
+    for proc in psutil.process_iter():
+        try:
+            proc.cpu_percent(None)
+            tracked.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return tracked
+
+
+_SKIP_CPU_NAMES = frozenset({"system idle process", "idle"})
+
+
+def _top_processes(
+    tracked: list[psutil.Process], limit: int = 2
+) -> tuple[list[ProcessUsage], list[ProcessUsage]]:
+    ram_candidates: list[ProcessUsage] = []
+    cpu_candidates: list[ProcessUsage] = []
+
+    for proc in tracked:
+        try:
+            name = proc.name() or f"pid-{proc.pid}"
+            memory_info = proc.memory_info()
+            ram_gb = memory_info.rss / (1024**3)
+            cpu_percent = proc.cpu_percent(None)
+
+            ram_candidates.append(ProcessUsage(name=name, pid=proc.pid, value=ram_gb))
+            if proc.pid != 0 and name.lower() not in _SKIP_CPU_NAMES:
+                cpu_candidates.append(
+                    ProcessUsage(name=name, pid=proc.pid, value=cpu_percent)
+                )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+    top_ram = sorted(ram_candidates, key=lambda p: p.value, reverse=True)[:limit]
+    top_cpu = sorted(cpu_candidates, key=lambda p: p.value, reverse=True)[:limit]
+    return top_ram, top_cpu
 
 
 def sample_resources(disk_path: str, cpu_interval: float = 1.0) -> ResourceSnapshot:
+    tracked = _prime_process_cpu()
     per_core = psutil.cpu_percent(interval=cpu_interval, percpu=True)
     avg_cpu = sum(per_core) / len(per_core) if per_core else 0.0
+    top_ram, top_cpu = _top_processes(tracked)
 
     memory = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -51,6 +102,8 @@ def sample_resources(disk_path: str, cpu_interval: float = 1.0) -> ResourceSnaps
         hostname=socket.gethostname(),
         load_avg=load_avg,
         uptime_seconds=time.time() - psutil.boot_time(),
+        top_ram_processes=top_ram,
+        top_cpu_processes=top_cpu,
     )
 
 
@@ -95,4 +148,22 @@ def format_status(snapshot: ResourceSnapshot) -> str:
         f"Disk ({snapshot.disk_path}): {snapshot.disk_used_gb:.2f} / "
         f"{snapshot.disk_total_gb:.2f} GB ({snapshot.disk_percent:.1f}%)"
     )
+
+    lines.extend(["", "Top RAM:"])
+    if snapshot.top_ram_processes:
+        for proc in snapshot.top_ram_processes:
+            lines.append(
+                f"  {proc.name} ({proc.pid}): {proc.value:.2f} GB"
+            )
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Top CPU:")
+    if snapshot.top_cpu_processes:
+        for proc in snapshot.top_cpu_processes:
+            lines.append(f"  {proc.name} ({proc.pid}): {proc.value:.1f}%")
+    else:
+        lines.append("  (none)")
+
     return "\n".join(lines)
