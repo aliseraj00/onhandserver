@@ -3,22 +3,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/onhandserver}"
-SERVICE_NAME="onhandserver"
+INSTALL_MODE=""
+USE_SYSTEMD=true
+NON_INTERACTIVE=false
 
 usage() {
     cat <<EOF
 Usage: sudo ./install.sh [options]
 
-Options:
-  --dir PATH     Install directory (default: /opt/onhandserver)
-  --systemd      Install and enable systemd service
-  -h, --help     Show this help
+Interactive installer — copies files, creates .env, installs deps, and starts the service.
 
-Without --systemd, only copies files and creates the virtualenv.
+Options:
+  --dir PATH       Install directory (default: /opt/onhandserver)
+  --bot            Non-interactive: install as Telegram bot (requires env vars below)
+  --agent          Non-interactive: install as remote agent (requires env vars below)
+  --no-systemd     Do not install or start a systemd service
+  --systemd        Install and enable systemd service (default in interactive mode)
+  -h, --help       Show this help
+
+Non-interactive bot env vars:
+  TELEGRAM_BOT_TOKEN, ADMIN_CHAT_IDS
+  Optional: SERVER_NAME, MONITOR_LOCAL, DISK_PATH
+
+Non-interactive agent env vars:
+  AGENT_TOKEN (auto-generated if unset)
+  Optional: DISK_PATH, AGENT_HOST, AGENT_PORT
 EOF
 }
-
-install_systemd=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,8 +37,22 @@ while [[ $# -gt 0 ]]; do
             INSTALL_DIR="$2"
             shift 2
             ;;
+        --bot)
+            INSTALL_MODE="bot"
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --agent)
+            INSTALL_MODE="agent"
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --no-systemd)
+            USE_SYSTEMD=false
+            shift
+            ;;
         --systemd)
-            install_systemd=true
+            USE_SYSTEMD=true
             shift
             ;;
         -h|--help)
@@ -42,57 +67,318 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$install_systemd" == true && "$(id -u)" -ne 0 ]]; then
-    echo "Run with sudo when using --systemd" >&2
-    exit 1
-fi
+prompt() {
+    local var_name="$1"
+    local prompt_text="$2"
+    local default="${3:-}"
+    local input=""
+    if [[ -n "$default" ]]; then
+        read -r -p "$prompt_text [$default]: " input
+        input="${input:-$default}"
+    else
+        read -r -p "$prompt_text: " input
+    fi
+    printf -v "$var_name" '%s' "$input"
+}
 
-echo "Installing to ${INSTALL_DIR}"
-mkdir -p "${INSTALL_DIR}"
-cp -r "${SCRIPT_DIR}/bot.py" \
-      "${SCRIPT_DIR}/agent.py" \
-      "${SCRIPT_DIR}/allowed_users.py" \
-      "${SCRIPT_DIR}/config_store.py" \
-      "${SCRIPT_DIR}/servers_store.py" \
-      "${SCRIPT_DIR}/remote_client.py" \
-      "${SCRIPT_DIR}/system_stats.py" \
-      "${SCRIPT_DIR}/requirements.txt" \
-      "${SCRIPT_DIR}/monitor_config.json" \
-      "${INSTALL_DIR}/"
+prompt_secret() {
+    local var_name="$1"
+    local prompt_text="$2"
+    local input=""
+    read -r -s -p "$prompt_text: " input
+    echo
+    printf -v "$var_name" '%s' "$input"
+}
 
-if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
-    cp "${SCRIPT_DIR}/.env.example" "${INSTALL_DIR}/.env"
-    echo "Created ${INSTALL_DIR}/.env — edit TELEGRAM_BOT_TOKEN and ADMIN_CHAT_IDS"
-fi
+prompt_yes_no() {
+    local prompt_text="$1"
+    local default="${2:-y}"
+    local hint="y/n"
+    local input=""
+    [[ "$default" == "y" ]] && hint="Y/n"
+    [[ "$default" == "n" ]] && hint="y/N"
+    read -r -p "$prompt_text ($hint): " input
+    input="${input:-$default}"
+    [[ "$input" =~ ^[Yy] ]]
+}
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is required. Install it first, e.g.: apt install python3 python3-venv python3-pip" >&2
-    exit 1
-fi
+generate_token() {
+    python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+}
 
-python3 -m venv "${INSTALL_DIR}/venv"
-"${INSTALL_DIR}/venv/bin/pip" install --upgrade pip
-"${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
+require_python() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required. Install it first, e.g.:" >&2
+        echo "  apt install python3 python3-venv python3-pip" >&2
+        exit 1
+    fi
+}
 
-if [[ "$install_systemd" == true ]]; then
-    sed "s|/opt/onhandserver|${INSTALL_DIR}|g" "${SCRIPT_DIR}/onhandserver.service" \
-        > "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}"
-    systemctl restart "${SERVICE_NAME}"
-    echo "Service installed. Status: systemctl status ${SERVICE_NAME}"
-else
-    cat <<EOF
+copy_files() {
+    echo ""
+    echo "Installing files to ${INSTALL_DIR} ..."
+    mkdir -p "${INSTALL_DIR}"
+    cp "${SCRIPT_DIR}/bot.py" \
+       "${SCRIPT_DIR}/agent.py" \
+       "${SCRIPT_DIR}/allowed_users.py" \
+       "${SCRIPT_DIR}/config_store.py" \
+       "${SCRIPT_DIR}/servers_store.py" \
+       "${SCRIPT_DIR}/remote_client.py" \
+       "${SCRIPT_DIR}/system_stats.py" \
+       "${SCRIPT_DIR}/requirements.txt" \
+       "${SCRIPT_DIR}/monitor_config.json" \
+       "${INSTALL_DIR}/"
+}
 
-Install complete.
+setup_venv() {
+    echo "Creating virtualenv and installing dependencies ..."
+    python3 -m venv "${INSTALL_DIR}/venv"
+    "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
+    "${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
+}
 
-1. Edit ${INSTALL_DIR}/.env
-2. Run manually:
-   cd ${INSTALL_DIR}
-   source venv/bin/activate
-   python bot.py
-
-3. Or install as a service:
-   sudo INSTALL_DIR=${INSTALL_DIR} ./install.sh --systemd
+write_bot_env() {
+    local env_file="${INSTALL_DIR}/.env"
+    cat > "${env_file}" <<EOF
+# OnHandServer — Telegram bot (generated by install.sh)
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+DISK_PATH=${DISK_PATH}
+SERVER_NAME=${SERVER_NAME}
+MONITOR_LOCAL=${MONITOR_LOCAL}
 EOF
+    chmod 600 "${env_file}"
+    echo "Wrote ${env_file}"
+}
+
+write_agent_env() {
+    local env_file="${INSTALL_DIR}/.env"
+    cat > "${env_file}" <<EOF
+# OnHandServer — remote agent (generated by install.sh)
+AGENT_TOKEN=${AGENT_TOKEN}
+DISK_PATH=${DISK_PATH}
+AGENT_HOST=${AGENT_HOST}
+AGENT_PORT=${AGENT_PORT}
+EOF
+    chmod 600 "${env_file}"
+    echo "Wrote ${env_file}"
+}
+
+install_systemd_service() {
+    local service_name="$1"
+    local unit_template="$2"
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo ""
+        echo "Systemd install needs root. Re-run with:"
+        echo "  sudo $0 --dir ${INSTALL_DIR}"
+        return 1
+    fi
+
+    sed "s|/opt/onhandserver|${INSTALL_DIR}|g" "${SCRIPT_DIR}/${unit_template}" \
+        > "/etc/systemd/system/${service_name}.service"
+
+    systemctl daemon-reload
+    systemctl enable "${service_name}"
+    systemctl restart "${service_name}"
+    echo ""
+    echo "============================================"
+    echo "  Service running"
+    echo "============================================"
+    systemctl --no-pager status "${service_name}" || true
+}
+
+run_interactive_setup() {
+    echo "============================================"
+    echo "  OnHandServer installer"
+    echo "============================================"
+    echo ""
+    echo "This sets up the Telegram monitor on this machine."
+    echo "Run with sudo if installing to ${INSTALL_DIR}."
+    echo ""
+
+    prompt INSTALL_DIR "Install directory" "${INSTALL_DIR}"
+
+    echo ""
+    echo "What is this machine?"
+    echo "  1) Bot server  — runs the Telegram bot (one per setup)"
+    echo "  2) Agent       — reports stats from this host to the bot"
+    echo ""
+    local role=""
+    while [[ "$role" != "1" && "$role" != "2" ]]; do
+        prompt role "Enter 1 or 2"
+    done
+
+    if [[ "$role" == "1" ]]; then
+        INSTALL_MODE="bot"
+    else
+        INSTALL_MODE="agent"
+    fi
+
+    echo ""
+    if [[ "$INSTALL_MODE" == "bot" ]]; then
+        echo "--- Bot configuration ---"
+        echo "Create a bot via @BotFather and paste the token below."
+        echo "Get your chat ID from @userinfobot or send /id after first start."
+        echo ""
+        while [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; do
+            prompt_secret TELEGRAM_BOT_TOKEN "Telegram bot token"
+            if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+                echo "Token cannot be empty."
+            fi
+        done
+        while [[ -z "${ADMIN_CHAT_IDS:-}" ]]; do
+            prompt ADMIN_CHAT_IDS "Admin chat ID(s), comma-separated"
+            if [[ -z "$ADMIN_CHAT_IDS" ]]; then
+                echo "At least one admin chat ID is required."
+            fi
+        done
+        prompt SERVER_NAME "Display name for this host (optional, Enter to skip)" ""
+        if prompt_yes_no "Monitor this machine's resources?" "y"; then
+            MONITOR_LOCAL="true"
+        else
+            MONITOR_LOCAL="false"
+        fi
+        prompt DISK_PATH "Disk path to monitor" "/"
+        DISK_PATH="${DISK_PATH:-/}"
+        SERVER_NAME="${SERVER_NAME:-}"
+    else
+        echo "--- Agent configuration ---"
+        echo "This host will expose stats to the bot over HTTP."
+        echo ""
+        if prompt_yes_no "Generate a random agent token?" "y"; then
+            AGENT_TOKEN="$(generate_token)"
+            echo "Generated token: ${AGENT_TOKEN}"
+            echo "(Save it — you need this when running /addserver on the bot)"
+        else
+            while [[ -z "${AGENT_TOKEN:-}" ]]; do
+                prompt_secret AGENT_TOKEN "Agent token (same value used in /addserver on the bot)"
+                if [[ -z "$AGENT_TOKEN" ]]; then
+                    echo "Token cannot be empty."
+                fi
+            done
+        fi
+        prompt DISK_PATH "Disk path to monitor" "/"
+        DISK_PATH="${DISK_PATH:-/}"
+        prompt AGENT_HOST "Listen address" "0.0.0.0"
+        AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
+        prompt AGENT_PORT "Listen port" "8765"
+        AGENT_PORT="${AGENT_PORT:-8765}"
+    fi
+
+    echo ""
+    if prompt_yes_no "Install as systemd service and start now?" "y"; then
+        USE_SYSTEMD=true
+    else
+        USE_SYSTEMD=false
+    fi
+}
+
+run_noninteractive_setup() {
+    require_python
+    if [[ "$INSTALL_MODE" == "bot" ]]; then
+        TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+        ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS:-}"
+        if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$ADMIN_CHAT_IDS" ]]; then
+            echo "Non-interactive bot install requires TELEGRAM_BOT_TOKEN and ADMIN_CHAT_IDS." >&2
+            exit 1
+        fi
+        SERVER_NAME="${SERVER_NAME:-}"
+        MONITOR_LOCAL="${MONITOR_LOCAL:-true}"
+        DISK_PATH="${DISK_PATH:-/}"
+    else
+        AGENT_TOKEN="${AGENT_TOKEN:-$(generate_token)}"
+        DISK_PATH="${DISK_PATH:-/}"
+        AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
+        AGENT_PORT="${AGENT_PORT:-8765}"
+    fi
+}
+
+confirm_overwrite_env() {
+    if [[ -f "${INSTALL_DIR}/.env" ]]; then
+        echo ""
+        echo "Existing ${INSTALL_DIR}/.env found."
+        if ! prompt_yes_no "Overwrite it?" "n"; then
+            echo "Keeping existing .env"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# --- main ---
+
+require_python
+
+if [[ "$NON_INTERACTIVE" == false ]]; then
+    run_interactive_setup
+else
+    run_noninteractive_setup
+fi
+
+copy_files
+setup_venv
+
+should_write_env=true
+if [[ "$NON_INTERACTIVE" == false ]]; then
+    should_write_env=false
+    if confirm_overwrite_env; then
+        should_write_env=true
+    fi
+fi
+
+if [[ "$should_write_env" == true ]]; then
+    if [[ "$INSTALL_MODE" == "bot" ]]; then
+        write_bot_env
+    else
+        write_agent_env
+    fi
+fi
+
+echo ""
+systemd_ok=false
+if [[ "$USE_SYSTEMD" == true ]]; then
+    if [[ "$INSTALL_MODE" == "bot" ]]; then
+        install_systemd_service "onhandserver" "onhandserver.service" && systemd_ok=true
+    else
+        install_systemd_service "onhandserver-agent" "onhandserver-agent.service" && systemd_ok=true
+    fi
+fi
+
+if [[ "$USE_SYSTEMD" == false || "$systemd_ok" == false ]]; then
+    echo "============================================"
+    echo "  Install complete"
+    echo "============================================"
+    echo ""
+    echo "Config: ${INSTALL_DIR}/.env"
+    echo ""
+    if [[ "$INSTALL_MODE" == "bot" ]]; then
+        echo "Run manually:"
+        echo "  cd ${INSTALL_DIR} && source venv/bin/activate && python bot.py"
+        echo ""
+        echo "Or install as a service:"
+        echo "  sudo ./install.sh --dir ${INSTALL_DIR} --bot --systemd"
+    else
+        echo "Run manually:"
+        echo "  cd ${INSTALL_DIR} && source venv/bin/activate && python agent.py"
+        echo ""
+        echo "Register on the bot (as admin):"
+        echo "  /addserver <name> http://<this-host-ip>:${AGENT_PORT:-8765} ${AGENT_TOKEN:-<your-token>}"
+        echo ""
+        echo "Or install as a service:"
+        echo "  sudo ./install.sh --dir ${INSTALL_DIR} --agent --systemd"
+    fi
+fi
+
+if [[ "$INSTALL_MODE" == "agent" && -n "${AGENT_TOKEN:-}" ]]; then
+    echo ""
+    echo "Agent token: ${AGENT_TOKEN}"
+    echo "Register with: /addserver <name> http://<this-ip>:${AGENT_PORT:-8765} ${AGENT_TOKEN}"
+    echo "Firewall: allow port ${AGENT_PORT:-8765} only from your bot server's IP."
+fi
+
+if [[ "$INSTALL_MODE" == "bot" ]]; then
+    echo ""
+    echo "Open Telegram and send /start to your bot."
+    echo "Add remote servers with: /addserver <name> <url> <token>"
 fi
