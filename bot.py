@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from allowed_users import AllowedUsersStore
 from config_store import ConfigStore
 from system_stats import format_status, sample_resources
 
@@ -21,30 +22,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "monitor_config.json"
+ALLOWED_USERS_PATH = Path(__file__).resolve().parent / "allowed_users.json"
 config = ConfigStore(CONFIG_PATH)
+allowed_users = AllowedUsersStore(ALLOWED_USERS_PATH)
 
-ALLOWED_CHAT_IDS = {
-    int(chat_id.strip())
-    for chat_id in os.getenv("ALLOWED_CHAT_IDS", "").split(",")
-    if chat_id.strip()
-}
+
+def _parse_chat_ids(env_name: str) -> set[int]:
+    return {
+        int(chat_id.strip())
+        for chat_id in os.getenv(env_name, "").split(",")
+        if chat_id.strip()
+    }
+
+
+# Admins can manage users; fall back to ALLOWED_CHAT_IDS for existing installs.
+ADMIN_CHAT_IDS = _parse_chat_ids("ADMIN_CHAT_IDS") or _parse_chat_ids(
+    "ALLOWED_CHAT_IDS"
+)
 
 # Runtime alert state (not persisted)
 _cpu_high_streak = 0
 _last_alert_at: dict[str, float] = {}
 
 
-def _authorized(update: Update) -> bool:
-    if not ALLOWED_CHAT_IDS:
-        return False
+def _allowed_chat_ids() -> set[int]:
+    return ADMIN_CHAT_IDS | allowed_users.chat_ids
+
+
+def _chat_id(update: Update) -> int | None:
     chat = update.effective_chat
-    return chat is not None and chat.id in ALLOWED_CHAT_IDS
+    return chat.id if chat is not None else None
+
+
+def _authorized(update: Update) -> bool:
+    chat_id = _chat_id(update)
+    return chat_id is not None and chat_id in _allowed_chat_ids()
+
+
+def _is_admin(update: Update) -> bool:
+    chat_id = _chat_id(update)
+    return chat_id is not None and chat_id in ADMIN_CHAT_IDS
 
 
 async def _deny(update: Update) -> None:
     if update.message:
         await update.message.reply_text(
-            "Unauthorized. Add your chat ID to ALLOWED_CHAT_IDS in .env"
+            "Unauthorized. Send /id to get your chat ID, then ask an admin to run "
+            "/adduser <id>."
         )
 
 
@@ -71,11 +95,95 @@ def _format_config() -> str:
     )
 
 
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not update.message or chat is None:
+        return
+    lines = [f"Chat ID: `{chat.id}`"]
+    if user is not None:
+        lines.append(f"User ID: `{user.id}`")
+    if chat.type != "private" and user is not None:
+        lines.append(
+            "\nIn groups, authorize this chat ID. In DMs, either chat or user ID works."
+        )
+    if _authorized(update):
+        lines.append("\nYou are authorized.")
+    elif _is_admin(update):
+        lines.append("\nYou are an admin.")
+    else:
+        lines.append(
+            "\nYou are not authorized yet. Send this ID to an admin so they can run "
+            "/adduser <id>."
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /adduser <chat_id>")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Chat ID must be a number.")
+        return
+    if chat_id in ADMIN_CHAT_IDS:
+        await update.message.reply_text(f"{chat_id} is already an admin.")
+        return
+    if allowed_users.add(chat_id):
+        await update.message.reply_text(f"Added user {chat_id}.")
+    else:
+        await update.message.reply_text(f"{chat_id} was already authorized.")
+
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /removeuser <chat_id>")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Chat ID must be a number.")
+        return
+    if chat_id in ADMIN_CHAT_IDS:
+        await update.message.reply_text("Cannot remove an admin from .env.")
+        return
+    if allowed_users.remove(chat_id):
+        await update.message.reply_text(f"Removed user {chat_id}.")
+    else:
+        await update.message.reply_text(f"{chat_id} is not in the allowed list.")
+
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    lines = ["Allowed users\n"]
+    lines.append("Admins (from .env):")
+    for chat_id in sorted(ADMIN_CHAT_IDS):
+        lines.append(f"  {chat_id}")
+    added = sorted(allowed_users.chat_ids)
+    lines.append("\nAdded via bot:")
+    if added:
+        for chat_id in added:
+            lines.append(f"  {chat_id}")
+    else:
+        lines.append("  (none)")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         await _deny(update)
         return
-    await update.message.reply_text(
+    help_text = (
         "Server resource monitor\n\n"
         "Commands:\n"
         "/status - current CPU, RAM, disk usage\n"
@@ -88,8 +196,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/setdisk <percent> - disk usage alert\n"
         "/setdiskpath <path> - disk to monitor (e.g. / or /home)\n"
         "/setinterval <seconds> - how often to check\n"
-        "/setcooldown <seconds> - minimum time between duplicate alerts"
+        "/setcooldown <seconds> - minimum time between duplicate alerts\n"
+        "/id - show your chat ID"
     )
+    if _is_admin(update):
+        help_text += (
+            "\n\nAdmin:\n"
+            "/adduser <id> - allow a user to use the bot\n"
+            "/removeuser <id> - revoke access\n"
+            "/users - list allowed users"
+        )
+    await update.message.reply_text(help_text)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -359,7 +476,7 @@ async def monitor_loop(application: Application) -> None:
                     sample_resources, config.data["disk_path"], 1.0
                 )
                 alerts = _evaluate_alerts(snapshot)
-                for chat_id in ALLOWED_CHAT_IDS:
+                for chat_id in _allowed_chat_ids():
                     for text in alerts:
                         try:
                             await application.bot.send_message(
@@ -384,11 +501,17 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
-    if not ALLOWED_CHAT_IDS:
-        raise SystemExit("Set ALLOWED_CHAT_IDS in .env (comma-separated chat IDs)")
+    if not ADMIN_CHAT_IDS:
+        raise SystemExit(
+            "Set ADMIN_CHAT_IDS or ALLOWED_CHAT_IDS in .env (comma-separated chat IDs)"
+        )
 
     application = Application.builder().token(token).post_init(post_init).build()
 
+    application.add_handler(CommandHandler("id", show_id))
+    application.add_handler(CommandHandler("adduser", add_user))
+    application.add_handler(CommandHandler("removeuser", remove_user))
+    application.add_handler(CommandHandler("users", list_users))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("status", status))

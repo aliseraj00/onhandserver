@@ -2,15 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="${INSTALL_DIR:-/opt/srv_checker}"
-SERVICE_NAME="srv-checker"
+INSTALL_DIR="${INSTALL_DIR:-/opt/onhandserver}"
+SERVICE_NAME="onhandserver"
 
 usage() {
     cat <<EOF
 Usage: sudo ./install.sh [options]
 
 Options:
-  --dir PATH     Install directory (default: /opt/srv_checker)
+  --dir PATH     Install directory (default: /opt/onhandserver)
   --systemd      Install and enable systemd service
   -h, --help     Show this help
 
@@ -50,6 +50,7 @@ fi
 echo "Installing to ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 cp -r "${SCRIPT_DIR}/bot.py" \
+      "${SCRIPT_DIR}/allowed_users.py" \
       "${SCRIPT_DIR}/config_store.py" \
       "${SCRIPT_DIR}/system_stats.py" \
       "${SCRIPT_DIR}/requirements.txt" \
@@ -58,7 +59,7 @@ cp -r "${SCRIPT_DIR}/bot.py" \
 
 if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
     cp "${SCRIPT_DIR}/.env.example" "${INSTALL_DIR}/.env"
-    echo "Created ${INSTALL_DIR}/.env — edit TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_IDS"
+    echo "Created ${INSTALL_DIR}/.env — edit TELEGRAM_BOT_TOKEN and ADMIN_CHAT_IDS"
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -71,7 +72,7 @@ python3 -m venv "${INSTALL_DIR}/venv"
 "${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
 
 if [[ "$install_systemd" == true ]]; then
-    sed "s|/opt/srv_checker|${INSTALL_DIR}|g" "${SCRIPT_DIR}/srv-checker.service" \
+    sed "s|/opt/onhandserver|${INSTALL_DIR}|g" "${SCRIPT_DIR}/onhandserver.service" \
         > "/etc/systemd/system/${SERVICE_NAME}.service"
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}"
