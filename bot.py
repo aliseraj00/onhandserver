@@ -5,7 +5,6 @@ import socket
 import time
 from pathlib import Path
 
-import psutil
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -20,7 +19,7 @@ from telegram.ext import (
 
 from allowed_users import AllowedUsersStore
 from config_store import ConfigStore
-from remote_client import RemoteAgentError, fetch_remote_status, ping_agent
+from agent_hub import AgentHub, RemoteAgentError, start_agent_hub
 from servers_store import ServersStore
 from system_stats import (
     ResourceSnapshot,
@@ -47,6 +46,11 @@ servers = ServersStore(SERVERS_PATH)
 LOCAL_SERVER_ID = "__local__"
 MONITOR_LOCAL = os.getenv("MONITOR_LOCAL", "true").lower() in ("1", "true", "yes")
 LOCAL_SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
+AGENT_HUB_HOST = os.getenv("AGENT_HUB_HOST", "0.0.0.0")
+AGENT_HUB_PORT = int(os.getenv("AGENT_HUB_PORT", "8766"))
+AGENT_HUB_PUBLIC_HOST = os.getenv("AGENT_HUB_PUBLIC_HOST", "").strip()
+
+agent_hub: AgentHub | None = None
 
 CB = "ohs"
 
@@ -123,10 +127,33 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
         return await asyncio.to_thread(
             sample_resources, config.data["disk_path"], 1.0
         )
-    entry = servers.get(server_id)
-    if entry is None:
-        raise RemoteAgentError("Server not found")
-    return await fetch_remote_status(entry["url"], entry["token"])
+    if agent_hub is None:
+        raise RemoteAgentError("Agent hub not running")
+    snapshot = agent_hub.get_snapshot(server_id)
+    if snapshot is None:
+        entry = servers.get(server_id)
+        label = entry["name"] if entry else server_id
+        if entry and not agent_hub.is_online(server_id):
+            raise RemoteAgentError(f"{label} is offline — agent not connected")
+        raise RemoteAgentError(f"No data from {label} yet — waiting for agent push")
+    return snapshot
+
+
+def _is_agent_online(server_id: str) -> bool:
+    return agent_hub is not None and agent_hub.is_online(server_id)
+
+
+def _format_agent_install_instructions(entry: dict) -> str:
+    host = AGENT_HUB_PUBLIC_HOST or "<your-bot-server-ip>"
+    return (
+        f"Agent slot: {entry['name']}\n\n"
+        "On the remote server run install.sh (agent mode) with:\n"
+        f"  BOT_SERVER_HOST={host}\n"
+        f"  BOT_SERVER_PORT={AGENT_HUB_PORT}\n"
+        f"  AGENT_NAME={entry['name']}\n"
+        f"  AGENT_TOKEN={entry['token']}\n\n"
+        "The agent connects outbound to the bot — no open port needed on the agent host."
+    )
 
 
 def _cb(*parts: str) -> str:
@@ -445,8 +472,7 @@ async def _servers_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
         )
     for entry in servers.servers:
         mark = "✓ " if selected == entry["id"] else ""
-        online = await ping_agent(entry["url"], entry["token"])
-        dot = "🟢" if online else "🔴"
+        dot = "🟢" if _is_agent_online(entry["id"]) else "🔴"
         rows.append(
             [
                 InlineKeyboardButton(
@@ -681,9 +707,9 @@ async def _show_servers(update: Update) -> None:
         lines.append(f"  local — {_local_display_name()}{marker}")
     for entry in servers.servers:
         marker = " ← selected" if selected == entry["id"] else ""
-        online = await ping_agent(entry["url"], entry["token"])
-        state = "online" if online else "offline"
-        lines.append(f"  {entry['name']} — {state}{marker}")
+        state = "online" if _is_agent_online(entry["id"]) else "offline"
+        host = entry.get("hostname") or "—"
+        lines.append(f"  {entry['name']} ({host}) — {state}{marker}")
     if not servers.servers and not MONITOR_LOCAL:
         lines.append("  (none)")
     await _send_or_edit(
@@ -1053,13 +1079,18 @@ async def _show_admin_servers(update: Update) -> None:
     if not _is_admin(update):
         await _deny(update)
         return
-    lines = ["Manage remote servers\n"]
+    lines = ["Manage agents\n"]
     if servers.servers:
         for entry in servers.servers:
-            lines.append(f"  • {entry['name']} — {entry['url']}")
+            state = "online" if _is_agent_online(entry["id"]) else "offline"
+            host = entry.get("hostname") or "—"
+            lines.append(f"  • {entry['name']} ({host}) — {state}")
     else:
-        lines.append("  (none)")
-    lines.append("\nAdd: name | url | token (token optional)")
+        lines.append("  (none — agents appear when they connect)")
+    lines.append(
+        f"\nHub: {AGENT_HUB_PUBLIC_HOST or '<bot-ip>'}:{AGENT_HUB_PORT}"
+    )
+    lines.append("Tap Add agent to create a slot, then install agent on remote host.")
     await _send_or_edit(
         update, "\n".join(lines), reply_markup=_admin_servers_keyboard()
     )
@@ -1111,30 +1142,17 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not _is_admin(update):
             _clear_awaiting(context)
             return
-        parts = [p.strip() for p in text.split("|")]
-        if len(parts) < 2:
-            await update.message.reply_text(
-                "Use format: name | url | token\nToken is optional."
-            )
+        name = text.strip()
+        if not name:
+            await update.message.reply_text("Send a name for the agent.")
             return
-        name, url = parts[0], parts[1]
-        token = parts[2] if len(parts) > 2 else ServersStore.generate_token()
         _clear_awaiting(context)
         try:
-            entry = servers.add(name, url, token)
+            entry = servers.create_agent(name)
         except ValueError as exc:
             await update.message.reply_text(str(exc))
             return
-        online = await ping_agent(entry["url"], entry["token"])
-        status_text = (
-            "reachable" if online else "not reachable (check URL, firewall, agent)"
-        )
-        await update.message.reply_text(
-            f"Added server {entry['name']}\n"
-            f"URL: {entry['url']}\n"
-            f"Token: {entry['token']}\n"
-            f"Agent: {status_text}"
-        )
+        await update.message.reply_text(_format_agent_install_instructions(entry))
         await _show_admin_servers(update)
         return
 
@@ -1363,8 +1381,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _set_awaiting(context, "addserver")
             await _send_or_edit(
                 update,
-                "Send server details:\nname | url | token\n\n"
-                "Token is optional — one will be generated if omitted.",
+                "Send a name for the new agent.\n\n"
+                "You will get install settings (bot IP, port, token) "
+                "to use on the remote host.",
                 reply_markup=InlineKeyboardMarkup([[_back_button("admin", "servers")]]),
             )
         elif sub == "rmuser" and len(parts) > 2:
@@ -1554,9 +1573,15 @@ async def monitor_loop(application: Application) -> None:
 
 
 async def post_init(application: Application) -> None:
+    global agent_hub
+    agent_hub, _, _ = start_agent_hub(servers, AGENT_HUB_HOST, AGENT_HUB_PORT)
     interval = int(config.data["check_interval_seconds"])
     application.create_task(monitor_loop(application))
-    logger.info("Background monitoring started (every %ss).", interval)
+    logger.info(
+        "Background monitoring started (every %ss). Agent hub on port %s.",
+        interval,
+        AGENT_HUB_PORT,
+    )
 
 
 def main() -> None:
