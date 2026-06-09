@@ -349,21 +349,35 @@ def _evaluate_alerts(snapshot) -> list[str]:
     return messages
 
 
-async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    config.load()
-    if not config.data["alerts_enabled"]:
-        return
+async def monitor_loop(application: Application) -> None:
+    while True:
+        config.load()
+        interval = int(config.data["check_interval_seconds"])
+        try:
+            if config.data["alerts_enabled"]:
+                snapshot = await asyncio.to_thread(
+                    sample_resources, config.data["disk_path"], 1.0
+                )
+                alerts = _evaluate_alerts(snapshot)
+                for chat_id in ALLOWED_CHAT_IDS:
+                    for text in alerts:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=chat_id, text=text
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to send alert to chat %s", chat_id
+                            )
+        except Exception:
+            logger.exception("Monitor loop error")
+        await asyncio.sleep(interval)
 
-    snapshot = await asyncio.to_thread(
-        sample_resources, config.data["disk_path"], 1.0
-    )
-    alerts = _evaluate_alerts(snapshot)
-    for chat_id in ALLOWED_CHAT_IDS:
-        for text in alerts:
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=text)
-            except Exception:
-                logger.exception("Failed to send alert to chat %s", chat_id)
+
+async def post_init(application: Application) -> None:
+    interval = int(config.data["check_interval_seconds"])
+    application.create_task(monitor_loop(application))
+    logger.info("Background monitoring started (every %ss).", interval)
 
 
 def main() -> None:
@@ -373,7 +387,7 @@ def main() -> None:
     if not ALLOWED_CHAT_IDS:
         raise SystemExit("Set ALLOWED_CHAT_IDS in .env (comma-separated chat IDs)")
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
@@ -389,10 +403,7 @@ def main() -> None:
     application.add_handler(CommandHandler("setinterval", set_interval))
     application.add_handler(CommandHandler("setcooldown", set_cooldown))
 
-    interval = int(config.data["check_interval_seconds"])
-    application.job_queue.run_repeating(monitor_job, interval=interval, first=interval)
-
-    logger.info("Bot started. Monitoring every %ss.", interval)
+    logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
