@@ -163,60 +163,251 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _settings_keyboard() -> InlineKeyboardMarkup:
+def _on_off(enabled: bool) -> str:
+    return "ON ✅" if enabled else "OFF ❌"
+
+
+def _format_server_alerts(server_id: str) -> str:
+    cfg = config.get_server_alerts(server_id)
+    label = _server_label(server_id)
+    ram_pct = cfg["ram_threshold_percent"]
+    ram_gb = cfg["ram_threshold_gb"]
+    ram_lines: list[str] = []
+    if ram_pct is not None:
+        ram_lines.append(f"  • Percent: {ram_pct:.0f}%")
+    if ram_gb is not None:
+        ram_lines.append(f"  • Used GB: {ram_gb:.2f} GB")
+    if not ram_lines:
+        ram_lines.append("  • (set a threshold below)")
+
+    return (
+        f"🔔 Alerts — {label}\n\n"
+        f"Master switch: {_on_off(cfg['enabled'])}\n\n"
+        f"CPU: {_on_off(cfg['cpu_enabled'])} — "
+        f"{cfg['cpu_threshold_percent']:.0f}% for {cfg['cpu_sustained_checks']} checks\n"
+        f"RAM: {_on_off(cfg['ram_enabled'])}\n"
+        + "\n".join(ram_lines)
+        + f"\nDisk: {_on_off(cfg['disk_enabled'])} — "
+        f"{cfg['disk_threshold_percent']:.0f}% used\n\n"
+        "Toggle resources below, or tap one to set thresholds."
+    )
+
+
+def _format_global_alerts() -> str:
     data = config.data
-    alerts_on = data["alerts_enabled"]
+    return (
+        "⏱ Global monitoring\n\n"
+        f"Check interval: {data['check_interval_seconds']}s\n"
+        f"Alert cooldown: {data['alert_cooldown_seconds']}s\n"
+        f"Local disk path: {data['disk_path']}\n\n"
+        "These apply to all servers."
+    )
+
+
+def _format_alert_picker_text() -> str:
+    return (
+        "⚙️ Alert settings\n\n"
+        "Pick a server to configure alerts separately.\n"
+        "🔔 = alerts on  🔕 = alerts off\n"
+        "[C/R/D] = CPU / RAM / Disk enabled\n\n"
+        "Each server can have different resources and thresholds."
+    )
+
+
+def _alert_server_picker_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for sid in _monitor_target_ids():
+        cfg = config.get_server_alerts(sid)
+        icon = "🔔" if cfg["enabled"] else "🔕"
+        tags = ""
+        if cfg["cpu_enabled"]:
+            tags += "C"
+        if cfg["ram_enabled"]:
+            tags += "R"
+        if cfg["disk_enabled"]:
+            tags += "D"
+        tag_text = f" [{tags}]" if tags else " [—]"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} {_server_label(sid)}{tag_text}",
+                    callback_data=_cb("al", "s", sid),
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("⏱ Global timing", callback_data=_cb("al", "g"))]
+    )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _server_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
+    cfg = config.get_server_alerts(server_id)
+    master_label = (
+        "🔕 Disable all alerts" if cfg["enabled"] else "🔔 Enable all alerts"
+    )
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    f"🔔 Alerts: {'ON' if alerts_on else 'OFF'}",
-                    callback_data=_cb("cfg", "alerts", "off" if alerts_on else "on"),
+                    master_label,
+                    callback_data=_cb("al", "s", server_id, "m", "0" if cfg["enabled"] else "1"),
                 )
             ],
             [
-                InlineKeyboardButton("CPU 80%", callback_data=_cb("cfg", "cpu", "80")),
-                InlineKeyboardButton("CPU 90%", callback_data=_cb("cfg", "cpu", "90")),
-                InlineKeyboardButton("CPU 95%", callback_data=_cb("cfg", "cpu", "95")),
-            ],
-            [
-                InlineKeyboardButton("Checks ×3", callback_data=_cb("cfg", "cpuck", "3")),
-                InlineKeyboardButton("Checks ×5", callback_data=_cb("cfg", "cpuck", "5")),
                 InlineKeyboardButton(
-                    "Checks ×10", callback_data=_cb("cfg", "cpuck", "10")
+                    f"CPU {_on_off(cfg['cpu_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "cpu"),
+                ),
+                InlineKeyboardButton(
+                    f"RAM {_on_off(cfg['ram_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "ram"),
+                ),
+                InlineKeyboardButton(
+                    f"Disk {_on_off(cfg['disk_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "disk"),
                 ),
             ],
             [
-                InlineKeyboardButton("RAM 80%", callback_data=_cb("cfg", "ram", "80")),
-                InlineKeyboardButton("RAM 90%", callback_data=_cb("cfg", "ram", "90")),
-                InlineKeyboardButton("RAM off", callback_data=_cb("cfg", "ram", "0")),
-            ],
-            [
-                InlineKeyboardButton("RAM 4GB", callback_data=_cb("cfg", "ramgb", "4")),
-                InlineKeyboardButton("RAM 8GB", callback_data=_cb("cfg", "ramgb", "8")),
                 InlineKeyboardButton(
-                    "RAM 16GB", callback_data=_cb("cfg", "ramgb", "16")
+                    "Toggle CPU",
+                    callback_data=_cb("al", "s", server_id, "c", "t"),
                 ),
-                InlineKeyboardButton("RAM GB off", callback_data=_cb("cfg", "ramgb", "0")),
-            ],
-            [
-                InlineKeyboardButton("Disk 80%", callback_data=_cb("cfg", "disk", "80")),
-                InlineKeyboardButton("Disk 90%", callback_data=_cb("cfg", "disk", "90")),
-                InlineKeyboardButton("Disk 95%", callback_data=_cb("cfg", "disk", "95")),
-            ],
-            [
-                InlineKeyboardButton("Every 30s", callback_data=_cb("cfg", "int", "30")),
-                InlineKeyboardButton("Every 60s", callback_data=_cb("cfg", "int", "60")),
                 InlineKeyboardButton(
-                    "Every 120s", callback_data=_cb("cfg", "int", "120")
+                    "Toggle RAM",
+                    callback_data=_cb("al", "s", server_id, "r", "t"),
+                ),
+                InlineKeyboardButton(
+                    "Toggle Disk",
+                    callback_data=_cb("al", "s", server_id, "d", "t"),
                 ),
             ],
             [
-                InlineKeyboardButton("CD 5m", callback_data=_cb("cfg", "cd", "300")),
-                InlineKeyboardButton("CD 10m", callback_data=_cb("cfg", "cd", "600")),
-                InlineKeyboardButton("CD 30m", callback_data=_cb("cfg", "cd", "1800")),
+                InlineKeyboardButton(
+                    "◀️ Servers", callback_data=_cb("al")
+                ),
+                _back_button(),
             ],
-            [_back_button()],
+        ]
+    )
+
+
+def _cpu_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
+    cfg = config.get_server_alerts(server_id)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"CPU alerts {_on_off(cfg['cpu_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "c", "t"),
+                )
+            ],
+            [
+                InlineKeyboardButton("80%", callback_data=_cb("al", "s", server_id, "c", "p", "80")),
+                InlineKeyboardButton("85%", callback_data=_cb("al", "s", server_id, "c", "p", "85")),
+                InlineKeyboardButton("90%", callback_data=_cb("al", "s", server_id, "c", "p", "90")),
+                InlineKeyboardButton("95%", callback_data=_cb("al", "s", server_id, "c", "p", "95")),
+            ],
+            [
+                InlineKeyboardButton("Checks ×3", callback_data=_cb("al", "s", server_id, "c", "k", "3")),
+                InlineKeyboardButton("Checks ×5", callback_data=_cb("al", "s", server_id, "c", "k", "5")),
+                InlineKeyboardButton("Checks ×10", callback_data=_cb("al", "s", server_id, "c", "k", "10")),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Custom %", callback_data=_cb("al", "s", server_id, "c", "u", "p")
+                ),
+                InlineKeyboardButton(
+                    "✏️ Custom checks", callback_data=_cb("al", "s", server_id, "c", "u", "k")
+                ),
+            ],
+            [_back_button("al", "s", server_id)],
+        ]
+    )
+
+
+def _ram_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
+    cfg = config.get_server_alerts(server_id)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"RAM alerts {_on_off(cfg['ram_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "r", "t"),
+                )
+            ],
+            [
+                InlineKeyboardButton("80%", callback_data=_cb("al", "s", server_id, "r", "p", "80")),
+                InlineKeyboardButton("90%", callback_data=_cb("al", "s", server_id, "r", "p", "90")),
+                InlineKeyboardButton("% off", callback_data=_cb("al", "s", server_id, "r", "p", "0")),
+            ],
+            [
+                InlineKeyboardButton("4 GB", callback_data=_cb("al", "s", server_id, "r", "g", "4")),
+                InlineKeyboardButton("8 GB", callback_data=_cb("al", "s", server_id, "r", "g", "8")),
+                InlineKeyboardButton("16 GB", callback_data=_cb("al", "s", server_id, "r", "g", "16")),
+                InlineKeyboardButton("GB off", callback_data=_cb("al", "s", server_id, "r", "g", "0")),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Custom %", callback_data=_cb("al", "s", server_id, "r", "u", "p")
+                ),
+                InlineKeyboardButton(
+                    "✏️ Custom GB", callback_data=_cb("al", "s", server_id, "r", "u", "g")
+                ),
+            ],
+            [_back_button("al", "s", server_id)],
+        ]
+    )
+
+
+def _disk_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
+    cfg = config.get_server_alerts(server_id)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Disk alerts {_on_off(cfg['disk_enabled'])}",
+                    callback_data=_cb("al", "s", server_id, "d", "t"),
+                )
+            ],
+            [
+                InlineKeyboardButton("80%", callback_data=_cb("al", "s", server_id, "d", "p", "80")),
+                InlineKeyboardButton("90%", callback_data=_cb("al", "s", server_id, "d", "p", "90")),
+                InlineKeyboardButton("95%", callback_data=_cb("al", "s", server_id, "d", "p", "95")),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Custom %", callback_data=_cb("al", "s", server_id, "d", "u", "p")
+                ),
+            ],
+            [_back_button("al", "s", server_id)],
+        ]
+    )
+
+
+def _global_alert_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Every 30s", callback_data=_cb("al", "g", "i", "30")),
+                InlineKeyboardButton("Every 60s", callback_data=_cb("al", "g", "i", "60")),
+                InlineKeyboardButton("Every 120s", callback_data=_cb("al", "g", "i", "120")),
+            ],
+            [
+                InlineKeyboardButton("CD 5m", callback_data=_cb("al", "g", "cd", "300")),
+                InlineKeyboardButton("CD 10m", callback_data=_cb("al", "g", "cd", "600")),
+                InlineKeyboardButton("CD 30m", callback_data=_cb("al", "g", "cd", "1800")),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Custom interval", callback_data=_cb("al", "g", "u", "i")
+                ),
+                InlineKeyboardButton(
+                    "✏️ Custom cooldown", callback_data=_cb("al", "g", "u", "cd")
+                ),
+            ],
+            [_back_button("al")],
         ]
     )
 
@@ -309,30 +500,6 @@ def _status_actions_keyboard(server_id: str | None) -> InlineKeyboardMarkup:
             ),
         )
     return InlineKeyboardMarkup(rows)
-
-
-def _format_config() -> str:
-    data = config.data
-    ram_percent = data["ram_threshold_percent"]
-    ram_gb = data["ram_threshold_gb"]
-    ram_rule = []
-    if ram_percent is not None:
-        ram_rule.append(f"{ram_percent}%")
-    if ram_gb is not None:
-        ram_rule.append(f"{ram_gb} GB used")
-    ram_text = " or ".join(ram_rule) if ram_rule else "disabled"
-
-    return (
-        "⚙️ Alert settings\n\n"
-        f"Alerts: {'ON' if data['alerts_enabled'] else 'OFF'}\n"
-        f"Check interval: {data['check_interval_seconds']}s\n"
-        f"Alert cooldown: {data['alert_cooldown_seconds']}s\n\n"
-        f"CPU: all cores >= {data['cpu_threshold_percent']}% for "
-        f"{data['cpu_sustained_checks']} checks in a row\n"
-        f"RAM: {ram_text}\n"
-        f"Disk ({data['disk_path']}): >= {data['disk_threshold_percent']}% used\n\n"
-        "Tap a button below to change a value."
-    )
 
 
 def _format_id_text(update: Update) -> str:
@@ -524,66 +691,318 @@ async def _show_settings(update: Update) -> None:
     if not _authorized(update):
         await _deny(update)
         return
+    targets = _monitor_target_ids()
+    if len(targets) == 1:
+        await _show_server_alerts(update, targets[0])
+        return
     await _send_or_edit(
-        update, _format_config(), reply_markup=_settings_keyboard()
+        update,
+        _format_alert_picker_text(),
+        reply_markup=_alert_server_picker_keyboard(),
     )
 
 
-async def _apply_config_change(update: Update, parts: list[str]) -> None:
+async def _show_server_alerts(update: Update, server_id: str) -> None:
+    if server_id != LOCAL_SERVER_ID and servers.get(server_id) is None:
+        await _show_settings(update)
+        return
+    await _send_or_edit(
+        update,
+        _format_server_alerts(server_id),
+        reply_markup=_server_alert_keyboard(server_id),
+    )
+
+
+async def _show_cpu_alerts(update: Update, server_id: str) -> None:
+    cfg = config.get_server_alerts(server_id)
+    text = (
+        f"CPU alerts — {_server_label(server_id)}\n\n"
+        f"Status: {_on_off(cfg['cpu_enabled'])}\n"
+        f"Threshold: {cfg['cpu_threshold_percent']:.0f}%\n"
+        f"Sustained checks: {cfg['cpu_sustained_checks']}\n\n"
+        "Pick a preset or send a custom value."
+    )
+    await _send_or_edit(
+        update, text, reply_markup=_cpu_alert_keyboard(server_id)
+    )
+
+
+async def _show_ram_alerts(update: Update, server_id: str) -> None:
+    cfg = config.get_server_alerts(server_id)
+    pct = cfg["ram_threshold_percent"]
+    gb = cfg["ram_threshold_gb"]
+    text = (
+        f"RAM alerts — {_server_label(server_id)}\n\n"
+        f"Status: {_on_off(cfg['ram_enabled'])}\n"
+        f"Percent: {f'{pct:.0f}%' if pct is not None else 'off'}\n"
+        f"Used GB: {f'{gb:.2f} GB' if gb is not None else 'off'}\n\n"
+        "Alert triggers if percent OR used GB threshold is exceeded."
+    )
+    await _send_or_edit(
+        update, text, reply_markup=_ram_alert_keyboard(server_id)
+    )
+
+
+async def _show_disk_alerts(update: Update, server_id: str) -> None:
+    cfg = config.get_server_alerts(server_id)
+    text = (
+        f"Disk alerts — {_server_label(server_id)}\n\n"
+        f"Status: {_on_off(cfg['disk_enabled'])}\n"
+        f"Threshold: {cfg['disk_threshold_percent']:.0f}% used\n"
+    )
+    await _send_or_edit(
+        update, text, reply_markup=_disk_alert_keyboard(server_id)
+    )
+
+
+async def _show_global_alerts(update: Update) -> None:
+    await _send_or_edit(
+        update,
+        _format_global_alerts(),
+        reply_markup=_global_alert_keyboard(),
+    )
+
+
+async def _handle_alert_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]
+) -> None:
     if not _authorized(update):
         await _deny(update)
         return
-    if len(parts) < 2:
+
+    if not parts:
+        await _show_settings(update)
         return
-    kind, value = parts[0], parts[1]
-    msg = ""
 
-    if kind == "alerts":
-        enabled = value == "on"
-        config.update(alerts_enabled=enabled)
-        msg = f"Alerts turned {'ON' if enabled else 'OFF'}."
-    elif kind == "cpu":
-        v = float(value)
-        config.update(cpu_threshold_percent=v)
-        msg = f"CPU threshold set to {v:.0f}%."
-    elif kind == "cpuck":
-        v = int(value)
-        config.update(cpu_sustained_checks=v)
-        msg = f"CPU sustained checks set to {v}."
-    elif kind == "ram":
-        v = float(value)
-        if v == 0:
-            config.update(ram_threshold_percent=None)
-            msg = "RAM percent alert disabled."
-        else:
-            config.update(ram_threshold_percent=v)
-            msg = f"RAM percent alert set to {v:.0f}%."
-    elif kind == "ramgb":
-        v = float(value)
-        if v == 0:
-            config.update(ram_threshold_gb=None)
-            msg = "RAM GB alert disabled."
-        else:
-            config.update(ram_threshold_gb=v)
-            msg = f"RAM GB alert set to {v:.2f} GB."
-    elif kind == "disk":
-        v = float(value)
-        config.update(disk_threshold_percent=v)
-        msg = f"Disk alert set to {v:.0f}%."
-    elif kind == "int":
-        v = int(value)
-        config.update(check_interval_seconds=v)
-        msg = f"Check interval set to {v}s."
-    elif kind == "cd":
-        v = int(value)
-        config.update(alert_cooldown_seconds=v)
-        msg = f"Alert cooldown set to {v}s."
+    if parts[0] == "g":
+        await _handle_global_alert_callback(update, context, parts[1:])
+        return
 
-    await _send_or_edit(
-        update,
-        f"{msg}\n\n{_format_config()}",
-        reply_markup=_settings_keyboard(),
-    )
+    if parts[0] != "s" or len(parts) < 2:
+        await _show_settings(update)
+        return
+
+    server_id = parts[1]
+    rest = parts[2:]
+
+    if not rest:
+        await _show_server_alerts(update, server_id)
+        return
+
+    action = rest[0]
+
+    if action == "m" and len(rest) > 1:
+        config.update_server_alerts(server_id, enabled=(rest[1] == "1"))
+        await _show_server_alerts(update, server_id)
+        return
+
+    if action in {"cpu", "ram", "disk"} and len(rest) == 1:
+        if action == "cpu":
+            await _show_cpu_alerts(update, server_id)
+        elif action == "ram":
+            await _show_ram_alerts(update, server_id)
+        else:
+            await _show_disk_alerts(update, server_id)
+        return
+
+    if action == "c":
+        await _apply_cpu_alert_change(update, context, server_id, rest[1:])
+        return
+    if action == "r":
+        await _apply_ram_alert_change(update, context, server_id, rest[1:])
+        return
+    if action == "d":
+        await _apply_disk_alert_change(update, context, server_id, rest[1:])
+        return
+
+    await _show_server_alerts(update, server_id)
+
+
+async def _handle_global_alert_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]
+) -> None:
+    if not parts:
+        await _show_global_alerts(update)
+        return
+
+    if parts[0] == "i" and len(parts) > 1:
+        config.update_global(check_interval_seconds=int(parts[1]))
+        await _show_global_alerts(update)
+        return
+
+    if parts[0] == "cd" and len(parts) > 1:
+        config.update_global(alert_cooldown_seconds=int(parts[1]))
+        await _show_global_alerts(update)
+        return
+
+    if parts[0] == "u" and len(parts) > 1:
+        field = parts[1]
+        prompts = {
+            "i": ("Send check interval in seconds (min 10):", "al_cfg_interval"),
+            "cd": ("Send alert cooldown in seconds (min 60):", "al_cfg_cooldown"),
+        }
+        if field in prompts:
+            prompt, action = prompts[field]
+            _set_awaiting(context, action)
+            await _send_or_edit(
+                update,
+                prompt,
+                reply_markup=InlineKeyboardMarkup([[_back_button("al", "g")]]),
+            )
+        return
+
+    await _show_global_alerts(update)
+
+
+async def _apply_cpu_alert_change(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    server_id: str,
+    parts: list[str],
+) -> None:
+    if not parts:
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if parts[0] == "t":
+        cfg = config.get_server_alerts(server_id)
+        config.update_server_alerts(server_id, cpu_enabled=not cfg["cpu_enabled"])
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if parts[0] == "p" and len(parts) > 1:
+        config.update_server_alerts(
+            server_id, cpu_enabled=True, cpu_threshold_percent=float(parts[1])
+        )
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if parts[0] == "k" and len(parts) > 1:
+        config.update_server_alerts(
+            server_id, cpu_enabled=True, cpu_sustained_checks=int(parts[1])
+        )
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if parts[0] == "u" and len(parts) > 1:
+        kind = parts[1]
+        if kind == "p":
+            _set_awaiting(context, "al_cfg_cpu_pct", server_id=server_id)
+            await _send_or_edit(
+                update,
+                f"Send CPU threshold % for {_server_label(server_id)} (1–100):",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_back_button("al", "s", server_id, "cpu")]]
+                ),
+            )
+        elif kind == "k":
+            _set_awaiting(context, "al_cfg_cpu_checks", server_id=server_id)
+            await _send_or_edit(
+                update,
+                f"Send sustained check count for {_server_label(server_id)} (min 1):",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_back_button("al", "s", server_id, "cpu")]]
+                ),
+            )
+        return
+
+    await _show_cpu_alerts(update, server_id)
+
+
+async def _apply_ram_alert_change(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    server_id: str,
+    parts: list[str],
+) -> None:
+    if not parts:
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if parts[0] == "t":
+        cfg = config.get_server_alerts(server_id)
+        config.update_server_alerts(server_id, ram_enabled=not cfg["ram_enabled"])
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if parts[0] == "p" and len(parts) > 1:
+        val = float(parts[1])
+        changes: dict = {"ram_enabled": True}
+        changes["ram_threshold_percent"] = None if val == 0 else val
+        config.update_server_alerts(server_id, **changes)
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if parts[0] == "g" and len(parts) > 1:
+        val = float(parts[1])
+        changes = {"ram_enabled": True}
+        changes["ram_threshold_gb"] = None if val == 0 else val
+        config.update_server_alerts(server_id, **changes)
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if parts[0] == "u" and len(parts) > 1:
+        kind = parts[1]
+        if kind == "p":
+            _set_awaiting(context, "al_cfg_ram_pct", server_id=server_id)
+            await _send_or_edit(
+                update,
+                f"Send RAM threshold % for {_server_label(server_id)} (1–100, or 0 to disable):",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_back_button("al", "s", server_id, "ram")]]
+                ),
+            )
+        elif kind == "g":
+            _set_awaiting(context, "al_cfg_ram_gb", server_id=server_id)
+            await _send_or_edit(
+                update,
+                f"Send RAM used GB threshold for {_server_label(server_id)} (>0, or 0 to disable):",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_back_button("al", "s", server_id, "ram")]]
+                ),
+            )
+        return
+
+    await _show_ram_alerts(update, server_id)
+
+
+async def _apply_disk_alert_change(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    server_id: str,
+    parts: list[str],
+) -> None:
+    if not parts:
+        await _show_disk_alerts(update, server_id)
+        return
+
+    if parts[0] == "t":
+        cfg = config.get_server_alerts(server_id)
+        config.update_server_alerts(server_id, disk_enabled=not cfg["disk_enabled"])
+        await _show_disk_alerts(update, server_id)
+        return
+
+    if parts[0] == "p" and len(parts) > 1:
+        config.update_server_alerts(
+            server_id,
+            disk_enabled=True,
+            disk_threshold_percent=float(parts[1]),
+        )
+        await _show_disk_alerts(update, server_id)
+        return
+
+    if parts[0] == "u" and len(parts) > 1 and parts[1] == "p":
+        _set_awaiting(context, "al_cfg_disk_pct", server_id=server_id)
+        await _send_or_edit(
+            update,
+            f"Send disk threshold % for {_server_label(server_id)} (1–100):",
+            reply_markup=InlineKeyboardMarkup(
+                [[_back_button("al", "s", server_id, "disk")]]
+            ),
+        )
+        return
+
+    await _show_disk_alerts(update, server_id)
 
 
 async def _show_admin_users(update: Update) -> None:
@@ -712,6 +1131,133 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError as exc:
             await update.message.reply_text(str(exc))
         await _show_admin_servers(update)
+        return
+
+    # alert custom values
+    server_id = extra.get("server_id")
+
+    if action == "al_cfg_cpu_pct" and server_id:
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number between 1 and 100.")
+            return
+        if not 1 <= value <= 100:
+            await update.message.reply_text("Percent must be between 1 and 100.")
+            return
+        _clear_awaiting(context)
+        config.update_server_alerts(
+            server_id, cpu_enabled=True, cpu_threshold_percent=value
+        )
+        await update.message.reply_text(f"CPU threshold set to {value:.0f}%.")
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if action == "al_cfg_cpu_checks" and server_id:
+        try:
+            value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter a whole number.")
+            return
+        if value < 1:
+            await update.message.reply_text("Must be at least 1.")
+            return
+        _clear_awaiting(context)
+        config.update_server_alerts(
+            server_id, cpu_enabled=True, cpu_sustained_checks=value
+        )
+        await update.message.reply_text(f"CPU sustained checks set to {value}.")
+        await _show_cpu_alerts(update, server_id)
+        return
+
+    if action == "al_cfg_ram_pct" and server_id:
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number.")
+            return
+        _clear_awaiting(context)
+        if value == 0:
+            config.update_server_alerts(server_id, ram_threshold_percent=None)
+            await update.message.reply_text("RAM percent alert disabled.")
+        elif 1 <= value <= 100:
+            config.update_server_alerts(
+                server_id, ram_enabled=True, ram_threshold_percent=value
+            )
+            await update.message.reply_text(f"RAM percent set to {value:.0f}%.")
+        else:
+            await update.message.reply_text("Percent must be between 1 and 100.")
+            return
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if action == "al_cfg_ram_gb" and server_id:
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number.")
+            return
+        _clear_awaiting(context)
+        if value == 0:
+            config.update_server_alerts(server_id, ram_threshold_gb=None)
+            await update.message.reply_text("RAM GB alert disabled.")
+        elif value > 0:
+            config.update_server_alerts(
+                server_id, ram_enabled=True, ram_threshold_gb=value
+            )
+            await update.message.reply_text(f"RAM GB threshold set to {value:.2f} GB.")
+        else:
+            await update.message.reply_text("GB must be greater than 0.")
+            return
+        await _show_ram_alerts(update, server_id)
+        return
+
+    if action == "al_cfg_disk_pct" and server_id:
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number between 1 and 100.")
+            return
+        if not 1 <= value <= 100:
+            await update.message.reply_text("Percent must be between 1 and 100.")
+            return
+        _clear_awaiting(context)
+        config.update_server_alerts(
+            server_id, disk_enabled=True, disk_threshold_percent=value
+        )
+        await update.message.reply_text(f"Disk threshold set to {value:.0f}%.")
+        await _show_disk_alerts(update, server_id)
+        return
+
+    if action == "al_cfg_interval":
+        try:
+            value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter seconds as a whole number.")
+            return
+        if value < 10:
+            await update.message.reply_text("Interval must be at least 10 seconds.")
+            return
+        _clear_awaiting(context)
+        config.update_global(check_interval_seconds=value)
+        await update.message.reply_text(f"Check interval set to {value}s.")
+        await _show_global_alerts(update)
+        return
+
+    if action == "al_cfg_cooldown":
+        try:
+            value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter seconds as a whole number.")
+            return
+        if value < 60:
+            await update.message.reply_text("Cooldown must be at least 60 seconds.")
+            return
+        _clear_awaiting(context)
+        config.update_global(alert_cooldown_seconds=value)
+        await update.message.reply_text(f"Alert cooldown set to {value}s.")
+        await _show_global_alerts(update)
+        return
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -767,8 +1313,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _show_settings(update)
         return
 
-    if action == "cfg":
-        await _apply_config_change(update, parts[1:])
+    if action == "al":
+        await _handle_alert_callback(update, context, parts[1:])
         return
 
     if action == "admin":
@@ -853,64 +1399,80 @@ def _can_send_alert(alert_key: str, cooldown: int) -> bool:
     return True
 
 
-def _evaluate_alerts(snapshot: ResourceSnapshot, server_id: str, label: str) -> list[str]:
-    data = config.data
+def _evaluate_alerts(
+    snapshot: ResourceSnapshot, server_id: str, label: str, cfg: dict
+) -> list[str]:
+    if not cfg["enabled"]:
+        return []
+
     messages: list[str] = []
-    cooldown = int(data["alert_cooldown_seconds"])
+    cooldown = int(config.data["alert_cooldown_seconds"])
 
-    cpu_threshold = float(data["cpu_threshold_percent"])
-    sustained = int(data["cpu_sustained_checks"])
-    all_cores_high = bool(snapshot.cpu_percent_per_core) and all(
-        core >= cpu_threshold for core in snapshot.cpu_percent_per_core
-    )
-    streak = _cpu_high_streak.get(server_id, 0)
-    if all_cores_high:
-        streak += 1
-    else:
-        streak = 0
-    _cpu_high_streak[server_id] = streak
-
-    if streak >= sustained and _can_send_alert(f"{server_id}:cpu", cooldown):
-        cores = ", ".join(f"{v:.0f}%" for v in snapshot.cpu_percent_per_core)
-        messages.append(
-            f"🚨 CPU alert on {label}\n"
-            f"Host: {snapshot.hostname}\n"
-            f"All cores >= {cpu_threshold:.0f}% for {sustained} checks.\n"
-            f"Cores: {cores}\n"
-            f"Average: {snapshot.cpu_percent_avg:.1f}%"
+    if cfg["cpu_enabled"]:
+        cpu_threshold = float(cfg["cpu_threshold_percent"])
+        sustained = int(cfg["cpu_sustained_checks"])
+        all_cores_high = bool(snapshot.cpu_percent_per_core) and all(
+            core >= cpu_threshold for core in snapshot.cpu_percent_per_core
         )
+        streak = _cpu_high_streak.get(server_id, 0)
+        if all_cores_high:
+            streak += 1
+        else:
+            streak = 0
+        _cpu_high_streak[server_id] = streak
+
+        if streak >= sustained and _can_send_alert(f"{server_id}:cpu", cooldown):
+            cores = ", ".join(f"{v:.0f}%" for v in snapshot.cpu_percent_per_core)
+            messages.append(
+                f"🚨 CPU alert on {label}\n"
+                f"Host: {snapshot.hostname}\n"
+                f"All cores >= {cpu_threshold:.0f}% for {sustained} checks.\n"
+                f"Cores: {cores}\n"
+                f"Average: {snapshot.cpu_percent_avg:.1f}%"
+            )
+            _cpu_high_streak[server_id] = 0
+    else:
         _cpu_high_streak[server_id] = 0
 
-    ram_percent_limit = data["ram_threshold_percent"]
-    ram_gb_limit = data["ram_threshold_gb"]
-    ram_triggered = False
-    if ram_percent_limit is not None and snapshot.ram_percent >= float(ram_percent_limit):
-        ram_triggered = True
-        reason = f"RAM usage {snapshot.ram_percent:.1f}% >= {ram_percent_limit:.0f}%"
-    elif ram_gb_limit is not None and snapshot.ram_used_gb >= float(ram_gb_limit):
-        ram_triggered = True
-        reason = (
-            f"RAM used {snapshot.ram_used_gb:.2f} GB >= {float(ram_gb_limit):.2f} GB"
-        )
-    else:
-        reason = ""
+    if cfg["ram_enabled"]:
+        ram_percent_limit = cfg["ram_threshold_percent"]
+        ram_gb_limit = cfg["ram_threshold_gb"]
+        ram_triggered = False
+        if ram_percent_limit is not None and snapshot.ram_percent >= float(
+            ram_percent_limit
+        ):
+            ram_triggered = True
+            reason = (
+                f"RAM usage {snapshot.ram_percent:.1f}% >= {ram_percent_limit:.0f}%"
+            )
+        elif ram_gb_limit is not None and snapshot.ram_used_gb >= float(ram_gb_limit):
+            ram_triggered = True
+            reason = (
+                f"RAM used {snapshot.ram_used_gb:.2f} GB "
+                f">= {float(ram_gb_limit):.2f} GB"
+            )
+        else:
+            reason = ""
 
-    if ram_triggered and _can_send_alert(f"{server_id}:ram", cooldown):
-        messages.append(
-            f"🚨 RAM alert on {label}\n"
-            f"Host: {snapshot.hostname}\n"
-            f"{reason}\n"
-            f"Total: {snapshot.ram_total_gb:.2f} GB"
-        )
+        if ram_triggered and _can_send_alert(f"{server_id}:ram", cooldown):
+            messages.append(
+                f"🚨 RAM alert on {label}\n"
+                f"Host: {snapshot.hostname}\n"
+                f"{reason}\n"
+                f"Total: {snapshot.ram_total_gb:.2f} GB"
+            )
 
-    disk_limit = float(data["disk_threshold_percent"])
-    if snapshot.disk_percent >= disk_limit and _can_send_alert(f"{server_id}:disk", cooldown):
-        messages.append(
-            f"🚨 Disk alert on {label}\n"
-            f"Host: {snapshot.hostname}\n"
-            f"Path {snapshot.disk_path}: {snapshot.disk_percent:.1f}% used "
-            f"({snapshot.disk_used_gb:.2f} / {snapshot.disk_total_gb:.2f} GB)"
-        )
+    if cfg["disk_enabled"]:
+        disk_limit = float(cfg["disk_threshold_percent"])
+        if snapshot.disk_percent >= disk_limit and _can_send_alert(
+            f"{server_id}:disk", cooldown
+        ):
+            messages.append(
+                f"🚨 Disk alert on {label}\n"
+                f"Host: {snapshot.hostname}\n"
+                f"Path {snapshot.disk_path}: {snapshot.disk_percent:.1f}% used "
+                f"({snapshot.disk_used_gb:.2f} / {snapshot.disk_total_gb:.2f} GB)"
+            )
 
     return messages
 
@@ -921,16 +1483,27 @@ async def monitor_loop(application: Application) -> None:
         servers.load()
         interval = int(config.data["check_interval_seconds"])
         try:
-            if config.data["alerts_enabled"]:
-                all_alerts: list[str] = []
-                for server_id in _monitor_target_ids():
-                    label = _server_label(server_id)
-                    try:
-                        snapshot = await _fetch_status(server_id)
-                    except RemoteAgentError:
-                        logger.warning("Monitor: could not reach %s", label)
-                        continue
-                    all_alerts.extend(_evaluate_alerts(snapshot, server_id, label))
+            all_alerts: list[str] = []
+            for server_id in _monitor_target_ids():
+                alert_cfg = config.get_server_alerts(server_id)
+                if not alert_cfg["enabled"]:
+                    continue
+                if not (
+                    alert_cfg["cpu_enabled"]
+                    or alert_cfg["ram_enabled"]
+                    or alert_cfg["disk_enabled"]
+                ):
+                    continue
+                label = _server_label(server_id)
+                try:
+                    snapshot = await _fetch_status(server_id)
+                except RemoteAgentError:
+                    logger.warning("Monitor: could not reach %s", label)
+                    continue
+                all_alerts.extend(
+                    _evaluate_alerts(snapshot, server_id, label, alert_cfg)
+                )
+            if all_alerts:
                 menu = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("📊 Open menu", callback_data=_cb("menu"))]]
                 )
