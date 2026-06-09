@@ -7,8 +7,16 @@ from pathlib import Path
 
 import psutil
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from allowed_users import AllowedUsersStore
 from config_store import ConfigStore
@@ -35,6 +43,8 @@ LOCAL_SERVER_ID = "__local__"
 MONITOR_LOCAL = os.getenv("MONITOR_LOCAL", "true").lower() in ("1", "true", "yes")
 LOCAL_SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
 
+CB = "ohs"
+
 
 def _parse_chat_ids(env_name: str) -> set[int]:
     return {
@@ -44,12 +54,10 @@ def _parse_chat_ids(env_name: str) -> set[int]:
     }
 
 
-# Admins can manage users; fall back to ALLOWED_CHAT_IDS for existing installs.
 ADMIN_CHAT_IDS = _parse_chat_ids("ADMIN_CHAT_IDS") or _parse_chat_ids(
     "ALLOWED_CHAT_IDS"
 )
 
-# Runtime alert state (not persisted)
 _cpu_high_streak: dict[str, int] = {}
 _last_alert_at: dict[str, float] = {}
 
@@ -85,13 +93,6 @@ def _monitor_target_ids() -> list[str]:
     return targets
 
 
-def _resolve_server_id(name: str) -> str | None:
-    if name.lower() == "local" and MONITOR_LOCAL:
-        return LOCAL_SERVER_ID
-    match = servers.get_by_name(name)
-    return match["id"] if match else None
-
-
 def _server_label(server_id: str) -> str:
     if server_id == LOCAL_SERVER_ID:
         return _local_display_name()
@@ -103,8 +104,7 @@ def _resolve_selection(chat_id: int | None) -> str | None:
     if chat_id is not None:
         selected = servers.get_selection(chat_id)
         if selected and (
-            selected == LOCAL_SERVER_ID
-            or servers.get(selected) is not None
+            selected == LOCAL_SERVER_ID or servers.get(selected) is not None
         ):
             return selected
     targets = _monitor_target_ids()
@@ -124,12 +124,191 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
     return await fetch_remote_status(entry["url"], entry["token"])
 
 
-async def _deny(update: Update) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "Unauthorized. Send /id to get your chat ID, then ask an admin to run "
-            "/adduser <id>."
+def _cb(*parts: str) -> str:
+    return ":".join((CB, *parts))
+
+
+def _parse_cb(data: str) -> list[str]:
+    if not data.startswith(CB + ":"):
+        return []
+    return data.split(":")[1:]
+
+
+def _back_button(*parts: str) -> InlineKeyboardButton:
+    target = parts if parts else ("menu",)
+    return InlineKeyboardButton("◀️ Back", callback_data=_cb(*target))
+
+
+def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("📊 Status", callback_data=_cb("status")),
+            InlineKeyboardButton("📋 All servers", callback_data=_cb("status", "all")),
+        ],
+        [
+            InlineKeyboardButton("🖥 Servers", callback_data=_cb("servers")),
+            InlineKeyboardButton("⚙️ Settings", callback_data=_cb("settings")),
+        ],
+        [InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))],
+    ]
+    if _is_admin(update):
+        rows.append(
+            [
+                InlineKeyboardButton("👤 Users", callback_data=_cb("admin", "users")),
+                InlineKeyboardButton(
+                    "🖥 Manage servers", callback_data=_cb("admin", "servers")
+                ),
+            ]
         )
+    return InlineKeyboardMarkup(rows)
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    data = config.data
+    alerts_on = data["alerts_enabled"]
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"🔔 Alerts: {'ON' if alerts_on else 'OFF'}",
+                    callback_data=_cb("cfg", "alerts", "off" if alerts_on else "on"),
+                )
+            ],
+            [
+                InlineKeyboardButton("CPU 80%", callback_data=_cb("cfg", "cpu", "80")),
+                InlineKeyboardButton("CPU 90%", callback_data=_cb("cfg", "cpu", "90")),
+                InlineKeyboardButton("CPU 95%", callback_data=_cb("cfg", "cpu", "95")),
+            ],
+            [
+                InlineKeyboardButton("Checks ×3", callback_data=_cb("cfg", "cpuck", "3")),
+                InlineKeyboardButton("Checks ×5", callback_data=_cb("cfg", "cpuck", "5")),
+                InlineKeyboardButton(
+                    "Checks ×10", callback_data=_cb("cfg", "cpuck", "10")
+                ),
+            ],
+            [
+                InlineKeyboardButton("RAM 80%", callback_data=_cb("cfg", "ram", "80")),
+                InlineKeyboardButton("RAM 90%", callback_data=_cb("cfg", "ram", "90")),
+                InlineKeyboardButton("RAM off", callback_data=_cb("cfg", "ram", "0")),
+            ],
+            [
+                InlineKeyboardButton("RAM 4GB", callback_data=_cb("cfg", "ramgb", "4")),
+                InlineKeyboardButton("RAM 8GB", callback_data=_cb("cfg", "ramgb", "8")),
+                InlineKeyboardButton(
+                    "RAM 16GB", callback_data=_cb("cfg", "ramgb", "16")
+                ),
+                InlineKeyboardButton("RAM GB off", callback_data=_cb("cfg", "ramgb", "0")),
+            ],
+            [
+                InlineKeyboardButton("Disk 80%", callback_data=_cb("cfg", "disk", "80")),
+                InlineKeyboardButton("Disk 90%", callback_data=_cb("cfg", "disk", "90")),
+                InlineKeyboardButton("Disk 95%", callback_data=_cb("cfg", "disk", "95")),
+            ],
+            [
+                InlineKeyboardButton("Every 30s", callback_data=_cb("cfg", "int", "30")),
+                InlineKeyboardButton("Every 60s", callback_data=_cb("cfg", "int", "60")),
+                InlineKeyboardButton(
+                    "Every 120s", callback_data=_cb("cfg", "int", "120")
+                ),
+            ],
+            [
+                InlineKeyboardButton("CD 5m", callback_data=_cb("cfg", "cd", "300")),
+                InlineKeyboardButton("CD 10m", callback_data=_cb("cfg", "cd", "600")),
+                InlineKeyboardButton("CD 30m", callback_data=_cb("cfg", "cd", "1800")),
+            ],
+            [_back_button()],
+        ]
+    )
+
+
+async def _servers_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
+    selected = _resolve_selection(chat_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if MONITOR_LOCAL:
+        mark = "✓ " if selected == LOCAL_SERVER_ID else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark}{_local_display_name()} (local)",
+                    callback_data=_cb("pick", LOCAL_SERVER_ID),
+                )
+            ]
+        )
+    for entry in servers.servers:
+        mark = "✓ " if selected == entry["id"] else ""
+        online = await ping_agent(entry["url"], entry["token"])
+        dot = "🟢" if online else "🔴"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark}{dot} {entry['name']}",
+                    callback_data=_cb("pick", entry["id"]),
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("📋 All servers", callback_data=_cb("status", "all"))]
+    )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_servers_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for entry in servers.servers:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗑 {entry['name']}",
+                    callback_data=_cb("admin", "rmsrv", entry["id"]),
+                ),
+                InlineKeyboardButton(
+                    "✏️ Rename",
+                    callback_data=_cb("admin", "rename", entry["id"]),
+                ),
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("➕ Add server", callback_data=_cb("admin", "addsrv"))]
+    )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_users_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for chat_id in sorted(allowed_users.chat_ids):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗑 {chat_id}",
+                    callback_data=_cb("admin", "rmuser", str(chat_id)),
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("➕ Add user", callback_data=_cb("admin", "adduser"))]
+    )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _status_actions_keyboard(server_id: str | None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data=_cb("status", "refresh"))],
+        [
+            InlineKeyboardButton("🖥 Servers", callback_data=_cb("servers")),
+            _back_button(),
+        ],
+    ]
+    if server_id:
+        rows[0].insert(
+            0,
+            InlineKeyboardButton(
+                "📊 This server", callback_data=_cb("status", server_id)
+            ),
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _format_config() -> str:
@@ -151,15 +330,16 @@ def _format_config() -> str:
         f"CPU: all cores >= {data['cpu_threshold_percent']}% for "
         f"{data['cpu_sustained_checks']} checks in a row\n"
         f"RAM: {ram_text}\n"
-        f"Disk ({data['disk_path']}): >= {data['disk_threshold_percent']}% used"
+        f"Disk ({data['disk_path']}): >= {data['disk_threshold_percent']}% used\n\n"
+        "Tap a button below to change a value."
     )
 
 
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _format_id_text(update: Update) -> str:
     chat = update.effective_chat
     user = update.effective_user
-    if not update.message or chat is None:
-        return
+    if chat is None:
+        return ""
     lines = [f"Chat ID: `{chat.id}`"]
     if user is not None:
         lines.append(f"User ID: `{user.id}`")
@@ -173,435 +353,495 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("\nYou are an admin.")
     else:
         lines.append(
-            "\nYou are not authorized yet. Send this ID to an admin so they can run "
-            "/adduser <id>."
+            "\nYou are not authorized yet. Send this ID to an admin to get access."
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return "\n".join(lines)
 
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /adduser <chat_id>")
-        return
-    try:
-        chat_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Chat ID must be a number.")
-        return
-    if chat_id in ADMIN_CHAT_IDS:
-        await update.message.reply_text(f"{chat_id} is already an admin.")
-        return
-    if allowed_users.add(chat_id):
-        await update.message.reply_text(f"Added user {chat_id}.")
-    else:
-        await update.message.reply_text(f"{chat_id} was already authorized.")
+async def _send_or_edit(
+    update: Update,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+    prefer_new: bool = False,
+) -> None:
+    if update.callback_query and not prefer_new:
+        query = update.callback_query
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                text, reply_markup=reply_markup, parse_mode=parse_mode
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                await query.message.reply_text(
+                    text, reply_markup=reply_markup, parse_mode=parse_mode
+                )
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
 
 
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /removeuser <chat_id>")
-        return
-    try:
-        chat_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Chat ID must be a number.")
-        return
-    if chat_id in ADMIN_CHAT_IDS:
-        await update.message.reply_text("Cannot remove an admin from .env.")
-        return
-    if allowed_users.remove(chat_id):
-        await update.message.reply_text(f"Removed user {chat_id}.")
-    else:
-        await update.message.reply_text(f"{chat_id} is not in the allowed list.")
+async def _deny(update: Update) -> None:
+    text = (
+        "Unauthorized. Tap My ID below, then ask an admin to add you."
+        if update.callback_query
+        else "Unauthorized. Send /start and tap My ID, then ask an admin to add you."
+    )
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))]]
+    )
+    await _send_or_edit(update, text, reply_markup=markup)
 
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await _deny(update)
-        return
-    lines = ["Allowed users\n"]
-    lines.append("Admins (from .env):")
-    for chat_id in sorted(ADMIN_CHAT_IDS):
-        lines.append(f"  {chat_id}")
-    added = sorted(allowed_users.chat_ids)
-    lines.append("\nAdded via bot:")
-    if added:
-        for chat_id in added:
-            lines.append(f"  {chat_id}")
-    else:
-        lines.append("  (none)")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _show_menu(update: Update, *, text: str | None = None) -> None:
     if not _authorized(update):
         await _deny(update)
         return
-    help_text = (
-        "Server resource monitor\n\n"
-        "Commands:\n"
-        "/status - CPU, RAM, disk for selected server\n"
-        "/status all - brief overview of every server\n"
-        "/servers - list servers and your current selection\n"
-        "/use <name> - select server (use 'local' for this host)\n"
-        "/config - show alert thresholds\n"
-        "/alerts on|off - enable or disable alerts\n"
-        "/setcpu <percent> - CPU alert when all cores stay high\n"
-        "/setcpu_checks <count> - how many checks in a row (default 3)\n"
-        "/setram <percent> - RAM alert by percent (use 0 to disable)\n"
-        "/setramgb <gb> - RAM alert by used GB (use 0 to disable)\n"
-        "/setdisk <percent> - disk usage alert\n"
-        "/setdiskpath <path> - disk to monitor (e.g. / or /home)\n"
-        "/setinterval <seconds> - how often to check\n"
-        "/setcooldown <seconds> - minimum time between duplicate alerts\n"
-        "/id - show your chat ID"
+    message = text or "Server resource monitor\n\nChoose an action:"
+    await _send_or_edit(update, message, reply_markup=_main_menu_keyboard(update))
+
+
+async def _build_status_text(server_id: str) -> str:
+    snapshot = await _fetch_status(server_id)
+    label = _server_label(server_id)
+    display_name = (
+        None if server_id == LOCAL_SERVER_ID and not LOCAL_SERVER_NAME else label
     )
-    if _is_admin(update):
-        help_text += (
-            "\n\nAdmin:\n"
-            "/adduser <id> - allow a user to use the bot\n"
-            "/removeuser <id> - revoke access\n"
-            "/users - list allowed users\n"
-            "/addserver <name> <url> [token] - register a remote agent\n"
-            "/removeserver <name> - unregister a remote server\n"
-            "/renameserver <old> <new> - rename a server"
+    return format_status(snapshot, display_name=display_name)
+
+
+async def _show_status(update: Update, server_id: str | None = None) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if server_id is None:
+        server_id = _resolve_selection(_chat_id(update))
+    if server_id is None:
+        await _send_or_edit(
+            update,
+            "Multiple servers available. Pick one from the list.",
+            reply_markup=await _servers_keyboard(_chat_id(update)),
         )
-    await update.message.reply_text(help_text)
+        return
+    try:
+        text = await _build_status_text(server_id)
+    except RemoteAgentError as exc:
+        await _send_or_edit(
+            update,
+            f"Could not reach {_server_label(server_id)}: {exc}",
+            reply_markup=await _servers_keyboard(_chat_id(update)),
+        )
+        return
+    await _send_or_edit(
+        update,
+        text,
+        reply_markup=_status_actions_keyboard(server_id),
+        prefer_new=True,
+    )
 
 
-async def list_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _show_status_all(update: Update) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+    targets = _monitor_target_ids()
+    if not targets:
+        await _show_menu(update, text="No servers configured.")
+        return
+    lines = ["All servers\n"]
+    for sid in targets:
+        label = _server_label(sid)
+        try:
+            snapshot = await _fetch_status(sid)
+            lines.append(
+                f"{label}: CPU {snapshot.cpu_percent_avg:.0f}%, "
+                f"RAM {snapshot.ram_percent:.0f}%, "
+                f"Disk {snapshot.disk_percent:.0f}%"
+            )
+        except RemoteAgentError:
+            lines.append(f"{label}: unreachable")
+    await _send_or_edit(
+        update,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔄 Refresh", callback_data=_cb("status", "all")
+                    )
+                ],
+                [_back_button()],
+            ]
+        ),
+    )
+
+
+async def _show_servers(update: Update) -> None:
     if not _authorized(update):
         await _deny(update)
         return
     chat_id = _chat_id(update)
     selected = _resolve_selection(chat_id)
-    lines = ["Registered servers\n"]
+    lines = ["Registered servers\nTap a server to select it and view status.\n"]
     if MONITOR_LOCAL:
         marker = " ← selected" if selected == LOCAL_SERVER_ID else ""
         lines.append(f"  local — {_local_display_name()}{marker}")
-    remote = servers.servers
-    if remote:
-        for entry in remote:
-            marker = " ← selected" if selected == entry["id"] else ""
-            online = await ping_agent(entry["url"], entry["token"])
-            state = "online" if online else "offline"
-            lines.append(f"  {entry['name']} — {state}{marker}")
-    elif not MONITOR_LOCAL:
-        lines.append("  (none — add with /addserver)")
-    if len(_monitor_target_ids()) > 1 and selected is None:
-        lines.append("\nUse /use <name> to pick a server for /status.")
-    await update.message.reply_text("\n".join(lines))
+    for entry in servers.servers:
+        marker = " ← selected" if selected == entry["id"] else ""
+        online = await ping_agent(entry["url"], entry["token"])
+        state = "online" if online else "offline"
+        lines.append(f"  {entry['name']} — {state}{marker}")
+    if not servers.servers and not MONITOR_LOCAL:
+        lines.append("  (none)")
+    await _send_or_edit(
+        update, "\n".join(lines), reply_markup=await _servers_keyboard(chat_id)
+    )
 
 
-async def use_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _pick_server(update: Update, server_id: str) -> None:
     if not _authorized(update):
         await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /use <name>  (use 'local' for this host)")
-        return
-    server_id = _resolve_server_id(context.args[0])
-    if server_id is None:
-        await update.message.reply_text(f"Unknown server: {context.args[0]}")
         return
     chat_id = _chat_id(update)
     if chat_id is None:
         return
+    if server_id != LOCAL_SERVER_ID and servers.get(server_id) is None:
+        await _show_servers(update)
+        return
     servers.set_selection(chat_id, server_id)
-    await update.message.reply_text(f"Selected server: {_server_label(server_id)}")
+    await _show_status(update, server_id)
 
 
-async def add_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
+async def _show_settings(update: Update) -> None:
+    if not _authorized(update):
         await _deny(update)
         return
-    if len(context.args) not in {2, 3}:
-        await update.message.reply_text(
-            "Usage: /addserver <name> <url> [token]\n"
-            "Example: /addserver prod http://10.0.0.5:8765 my-secret-token"
-        )
-        return
-    name, url = context.args[0], context.args[1]
-    token = context.args[2] if len(context.args) == 3 else ServersStore.generate_token()
-    try:
-        entry = servers.add(name, url, token)
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    online = await ping_agent(entry["url"], entry["token"])
-    status_text = "reachable" if online else "not reachable (check URL, firewall, agent)"
-    await update.message.reply_text(
-        f"Added server {entry['name']}\n"
-        f"URL: {entry['url']}\n"
-        f"Token: {entry['token']}\n"
-        f"Agent: {status_text}\n\n"
-        "Set the same AGENT_TOKEN on the remote host's .env."
+    await _send_or_edit(
+        update, _format_config(), reply_markup=_settings_keyboard()
     )
 
 
-async def remove_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
+async def _apply_config_change(update: Update, parts: list[str]) -> None:
+    if not _authorized(update):
         await _deny(update)
         return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /removeserver <name>")
+    if len(parts) < 2:
         return
-    if servers.remove(context.args[0]):
-        await update.message.reply_text(f"Removed server {context.args[0]}.")
-    else:
-        await update.message.reply_text(f"Server not found: {context.args[0]}")
+    kind, value = parts[0], parts[1]
+    msg = ""
 
-
-async def rename_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await _deny(update)
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /renameserver <old_name> <new_name>")
-        return
-    try:
-        if servers.rename(context.args[0], context.args[1]):
-            await update.message.reply_text(
-                f"Renamed {context.args[0]} → {context.args[1]}."
-            )
+    if kind == "alerts":
+        enabled = value == "on"
+        config.update(alerts_enabled=enabled)
+        msg = f"Alerts turned {'ON' if enabled else 'OFF'}."
+    elif kind == "cpu":
+        v = float(value)
+        config.update(cpu_threshold_percent=v)
+        msg = f"CPU threshold set to {v:.0f}%."
+    elif kind == "cpuck":
+        v = int(value)
+        config.update(cpu_sustained_checks=v)
+        msg = f"CPU sustained checks set to {v}."
+    elif kind == "ram":
+        v = float(value)
+        if v == 0:
+            config.update(ram_threshold_percent=None)
+            msg = "RAM percent alert disabled."
         else:
-            await update.message.reply_text(f"Server not found: {context.args[0]}")
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
+            config.update(ram_threshold_percent=v)
+            msg = f"RAM percent alert set to {v:.0f}%."
+    elif kind == "ramgb":
+        v = float(value)
+        if v == 0:
+            config.update(ram_threshold_gb=None)
+            msg = "RAM GB alert disabled."
+        else:
+            config.update(ram_threshold_gb=v)
+            msg = f"RAM GB alert set to {v:.2f} GB."
+    elif kind == "disk":
+        v = float(value)
+        config.update(disk_threshold_percent=v)
+        msg = f"Disk alert set to {v:.0f}%."
+    elif kind == "int":
+        v = int(value)
+        config.update(check_interval_seconds=v)
+        msg = f"Check interval set to {v}s."
+    elif kind == "cd":
+        v = int(value)
+        config.update(alert_cooldown_seconds=v)
+        msg = f"Alert cooldown set to {v}s."
+
+    await _send_or_edit(
+        update,
+        f"{msg}\n\n{_format_config()}",
+        reply_markup=_settings_keyboard(),
+    )
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+async def _show_admin_users(update: Update) -> None:
+    if not _is_admin(update):
         await _deny(update)
         return
-    if context.args and context.args[0].lower() == "all":
-        targets = _monitor_target_ids()
-        if not targets:
-            await update.message.reply_text("No servers configured.")
+    lines = ["Allowed users\n"]
+    lines.append("Admins (from .env):")
+    for cid in sorted(ADMIN_CHAT_IDS):
+        lines.append(f"  {cid}")
+    added = sorted(allowed_users.chat_ids)
+    lines.append("\nAdded via bot (tap to remove):")
+    if added:
+        for cid in added:
+            lines.append(f"  {cid}")
+    else:
+        lines.append("  (none)")
+    await _send_or_edit(
+        update, "\n".join(lines), reply_markup=_admin_users_keyboard()
+    )
+
+
+async def _show_admin_servers(update: Update) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    lines = ["Manage remote servers\n"]
+    if servers.servers:
+        for entry in servers.servers:
+            lines.append(f"  • {entry['name']} — {entry['url']}")
+    else:
+        lines.append("  (none)")
+    lines.append("\nAdd: name | url | token (token optional)")
+    await _send_or_edit(
+        update, "\n".join(lines), reply_markup=_admin_servers_keyboard()
+    )
+
+
+def _set_awaiting(context: ContextTypes.DEFAULT_TYPE, action: str, **extra) -> None:
+    context.user_data["awaiting"] = action
+    context.user_data["awaiting_extra"] = extra
+
+
+def _clear_awaiting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("awaiting_extra", None)
+
+
+async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    action = context.user_data.get("awaiting")
+    if not action:
+        return
+
+    text = update.message.text.strip()
+    extra = context.user_data.get("awaiting_extra", {})
+
+    if action == "adduser":
+        if not _is_admin(update):
+            _clear_awaiting(context)
             return
-        lines = ["All servers\n"]
-        for server_id in targets:
-            label = _server_label(server_id)
+        try:
+            user_id = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                "Chat ID must be a number. Try again or tap Back in the menu.",
+                reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+            )
+            return
+        _clear_awaiting(context)
+        if user_id in ADMIN_CHAT_IDS:
+            await update.message.reply_text(f"{user_id} is already an admin.")
+        elif allowed_users.add(user_id):
+            await update.message.reply_text(f"Added user {user_id}.")
+        else:
+            await update.message.reply_text(f"{user_id} was already authorized.")
+        await _show_menu(update)
+        return
+
+    if action == "addserver":
+        if not _is_admin(update):
+            _clear_awaiting(context)
+            return
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Use format: name | url | token\nToken is optional."
+            )
+            return
+        name, url = parts[0], parts[1]
+        token = parts[2] if len(parts) > 2 else ServersStore.generate_token()
+        _clear_awaiting(context)
+        try:
+            entry = servers.add(name, url, token)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        online = await ping_agent(entry["url"], entry["token"])
+        status_text = (
+            "reachable" if online else "not reachable (check URL, firewall, agent)"
+        )
+        await update.message.reply_text(
+            f"Added server {entry['name']}\n"
+            f"URL: {entry['url']}\n"
+            f"Token: {entry['token']}\n"
+            f"Agent: {status_text}"
+        )
+        await _show_admin_servers(update)
+        return
+
+    if action == "rename":
+        if not _is_admin(update):
+            _clear_awaiting(context)
+            return
+        server_id = extra.get("server_id")
+        _clear_awaiting(context)
+        if not server_id:
+            return
+        old = _server_label(server_id)
+        try:
+            if servers.rename(old, text):
+                await update.message.reply_text(f"Renamed {old} → {text}.")
+            else:
+                await update.message.reply_text("Server not found.")
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+        await _show_admin_servers(update)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = _parse_cb(query.data)
+    if not parts:
+        await query.answer()
+        return
+
+    action = parts[0]
+
+    if action == "menu":
+        _clear_awaiting(context)
+        await _show_menu(update)
+        return
+
+    if action == "id":
+        await _send_or_edit(
+            update,
+            _format_id_text(update),
+            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+            parse_mode="Markdown",
+        )
+        return
+
+    if not _authorized(update):
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    if action == "status":
+        if len(parts) > 1 and parts[1] == "all":
+            await _show_status_all(update)
+        elif len(parts) > 1 and parts[1] == "refresh":
+            await _show_status(update)
+        elif len(parts) > 1:
+            await _show_status(update, parts[1])
+        else:
+            await _show_status(update)
+        return
+
+    if action == "servers":
+        await _show_servers(update)
+        return
+
+    if action == "pick" and len(parts) > 1:
+        await _pick_server(update, parts[1])
+        return
+
+    if action == "settings":
+        await _show_settings(update)
+        return
+
+    if action == "cfg":
+        await _apply_config_change(update, parts[1:])
+        return
+
+    if action == "admin":
+        if not _is_admin(update):
+            await query.answer("Admin only", show_alert=True)
+            return
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "users":
+            _clear_awaiting(context)
+            await _show_admin_users(update)
+        elif sub == "servers":
+            _clear_awaiting(context)
+            await _show_admin_servers(update)
+        elif sub == "adduser":
+            _set_awaiting(context, "adduser")
+            await _send_or_edit(
+                update,
+                "Send the chat ID to authorize.\nExample: 123456789",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admin", "users")]]),
+            )
+        elif sub == "addsrv":
+            _set_awaiting(context, "addserver")
+            await _send_or_edit(
+                update,
+                "Send server details:\nname | url | token\n\n"
+                "Token is optional — one will be generated if omitted.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admin", "servers")]]),
+            )
+        elif sub == "rmuser" and len(parts) > 2:
             try:
-                snapshot = await _fetch_status(server_id)
-                lines.append(
-                    f"{label}: CPU {snapshot.cpu_percent_avg:.0f}%, "
-                    f"RAM {snapshot.ram_percent:.0f}%, "
-                    f"Disk {snapshot.disk_percent:.0f}%"
-                )
-            except RemoteAgentError:
-                lines.append(f"{label}: unreachable")
-        await update.message.reply_text("\n".join(lines))
+                uid = int(parts[2])
+            except ValueError:
+                return
+            if uid in ADMIN_CHAT_IDS:
+                await query.answer("Cannot remove an admin", show_alert=True)
+            elif allowed_users.remove(uid):
+                await query.answer(f"Removed {uid}")
+            else:
+                await query.answer("User not found", show_alert=True)
+            await _show_admin_users(update)
+        elif sub == "rmsrv" and len(parts) > 2:
+            entry = servers.get(parts[2])
+            if entry and servers.remove(entry["name"]):
+                await query.answer(f"Removed {entry['name']}")
+            else:
+                await query.answer("Server not found", show_alert=True)
+            await _show_admin_servers(update)
+        elif sub == "rename" and len(parts) > 2:
+            _set_awaiting(context, "rename", server_id=parts[2])
+            label = _server_label(parts[2])
+            await _send_or_edit(
+                update,
+                f"Send new name for {label}:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[_back_button("admin", "servers")]]
+                ),
+            )
         return
 
-    server_id = _resolve_selection(_chat_id(update))
-    if server_id is None:
-        await update.message.reply_text(
-            "Multiple servers available. Use /servers to list them, "
-            "then /use <name> to select one.\n"
-            "Or send /status all for a quick overview."
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _clear_awaiting(context)
+    if not _authorized(update):
+        await _send_or_edit(
+            update,
+            _format_id_text(update),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))]]
+            ),
+            parse_mode="Markdown",
         )
         return
-    try:
-        snapshot = await _fetch_status(server_id)
-    except RemoteAgentError as exc:
-        await update.message.reply_text(
-            f"Could not reach {_server_label(server_id)}: {exc}"
-        )
-        return
-    label = _server_label(server_id)
-    display_name = (
-        None if server_id == LOCAL_SERVER_ID and not LOCAL_SERVER_NAME else label
-    )
-    await update.message.reply_text(
-        format_status(snapshot, display_name=display_name)
-    )
-
-
-async def show_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    await update.message.reply_text(_format_config())
-
-
-async def set_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1 or context.args[0].lower() not in {"on", "off"}:
-        await update.message.reply_text("Usage: /alerts on|off")
-        return
-    enabled = context.args[0].lower() == "on"
-    config.update(alerts_enabled=enabled)
-    await update.message.reply_text(f"Alerts turned {'ON' if enabled else 'OFF'}.")
-
-
-async def set_cpu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setcpu <percent>")
-        return
-    try:
-        value = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Percent must be a number.")
-        return
-    if not 1 <= value <= 100:
-        await update.message.reply_text("Percent must be between 1 and 100.")
-        return
-    config.update(cpu_threshold_percent=value)
-    await update.message.reply_text(
-        f"CPU alert set: all cores >= {value:.0f}% for "
-        f"{config.data['cpu_sustained_checks']} checks."
-    )
-
-
-async def set_cpu_checks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setcpu_checks <count>")
-        return
-    try:
-        value = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Count must be an integer.")
-        return
-    if value < 1:
-        await update.message.reply_text("Count must be at least 1.")
-        return
-    config.update(cpu_sustained_checks=value)
-    await update.message.reply_text(f"CPU sustained checks set to {value}.")
-
-
-async def set_ram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setram <percent> (0 to disable)")
-        return
-    try:
-        value = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Percent must be a number.")
-        return
-    if value == 0:
-        config.update(ram_threshold_percent=None)
-        await update.message.reply_text("RAM percent alert disabled.")
-        return
-    if not 1 <= value <= 100:
-        await update.message.reply_text("Percent must be between 1 and 100.")
-        return
-    config.update(ram_threshold_percent=value)
-    await update.message.reply_text(f"RAM percent alert set to {value:.0f}%.")
-
-
-async def set_ram_gb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setramgb <gb> (0 to disable)")
-        return
-    try:
-        value = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("GB must be a number.")
-        return
-    if value == 0:
-        config.update(ram_threshold_gb=None)
-        await update.message.reply_text("RAM GB alert disabled.")
-        return
-    if value <= 0:
-        await update.message.reply_text("GB must be greater than 0.")
-        return
-    config.update(ram_threshold_gb=value)
-    await update.message.reply_text(f"RAM GB alert set to {value:.2f} GB used.")
-
-
-async def set_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setdisk <percent>")
-        return
-    try:
-        value = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Percent must be a number.")
-        return
-    if not 1 <= value <= 100:
-        await update.message.reply_text("Percent must be between 1 and 100.")
-        return
-    config.update(disk_threshold_percent=value)
-    await update.message.reply_text(f"Disk alert set to {value:.0f}% used.")
-
-
-async def set_disk_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setdiskpath <path>")
-        return
-    path = context.args[0]
-    try:
-        _ = psutil.disk_usage(path).total
-    except Exception:
-        await update.message.reply_text(f"Invalid or inaccessible path: {path}")
-        return
-    config.update(disk_path=path)
-    await update.message.reply_text(f"Disk path set to {path}")
-
-
-async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setinterval <seconds>")
-        return
-    try:
-        value = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Seconds must be an integer.")
-        return
-    if value < 10:
-        await update.message.reply_text("Interval must be at least 10 seconds.")
-        return
-    config.update(check_interval_seconds=value)
-    await update.message.reply_text(f"Check interval set to {value}s.")
-
-
-async def set_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /setcooldown <seconds>")
-        return
-    try:
-        value = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Seconds must be an integer.")
-        return
-    if value < 60:
-        await update.message.reply_text("Cooldown must be at least 60 seconds.")
-        return
-    config.update(alert_cooldown_seconds=value)
-    await update.message.reply_text(f"Alert cooldown set to {value}s.")
+    await _show_menu(update)
 
 
 def _can_send_alert(alert_key: str, cooldown: int) -> bool:
@@ -691,11 +931,14 @@ async def monitor_loop(application: Application) -> None:
                         logger.warning("Monitor: could not reach %s", label)
                         continue
                     all_alerts.extend(_evaluate_alerts(snapshot, server_id, label))
+                menu = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📊 Open menu", callback_data=_cb("menu"))]]
+                )
                 for chat_id in _allowed_chat_ids():
                     for text in all_alerts:
                         try:
                             await application.bot.send_message(
-                                chat_id=chat_id, text=text
+                                chat_id=chat_id, text=text, reply_markup=menu
                             )
                         except Exception:
                             logger.exception(
@@ -723,28 +966,12 @@ def main() -> None:
 
     application = Application.builder().token(token).post_init(post_init).build()
 
-    application.add_handler(CommandHandler("id", show_id))
-    application.add_handler(CommandHandler("adduser", add_user))
-    application.add_handler(CommandHandler("removeuser", remove_user))
-    application.add_handler(CommandHandler("users", list_users))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
-    application.add_handler(CommandHandler("servers", list_servers))
-    application.add_handler(CommandHandler("use", use_server))
-    application.add_handler(CommandHandler("addserver", add_server))
-    application.add_handler(CommandHandler("removeserver", remove_server))
-    application.add_handler(CommandHandler("renameserver", rename_server))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("config", show_config))
-    application.add_handler(CommandHandler("alerts", set_alerts))
-    application.add_handler(CommandHandler("setcpu", set_cpu))
-    application.add_handler(CommandHandler("setcpu_checks", set_cpu_checks))
-    application.add_handler(CommandHandler("setram", set_ram))
-    application.add_handler(CommandHandler("setramgb", set_ram_gb))
-    application.add_handler(CommandHandler("setdisk", set_disk))
-    application.add_handler(CommandHandler("setdiskpath", set_disk_path))
-    application.add_handler(CommandHandler("setinterval", set_interval))
-    application.add_handler(CommandHandler("setcooldown", set_cooldown))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text_input)
+    )
 
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
