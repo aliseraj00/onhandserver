@@ -1,9 +1,9 @@
+import json
 import logging
 import os
-import socket
-import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
-import httpx
 from dotenv import load_dotenv
 
 from system_stats import sample_resources, snapshot_to_dict
@@ -17,85 +17,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 AGENT_TOKEN = os.getenv("AGENT_TOKEN", "")
-AGENT_NAME = os.getenv("AGENT_NAME", "").strip()
-BOT_SERVER_HOST = os.getenv("BOT_SERVER_HOST", "").strip()
-BOT_SERVER_PORT = int(os.getenv("BOT_SERVER_PORT", "8766"))
 DISK_PATH = os.getenv("DISK_PATH", "/")
-PUSH_INTERVAL = int(os.getenv("PUSH_INTERVAL", "30"))
+AGENT_HOST = os.getenv("AGENT_HOST", "0.0.0.0")
+AGENT_PORT = int(os.getenv("AGENT_PORT", "8765"))
 
 
-def _hub_url(path: str) -> str:
-    return f"http://{BOT_SERVER_HOST}:{BOT_SERVER_PORT}{path}"
+class AgentHandler(BaseHTTPRequestHandler):
+    server_version = "OnHandServerAgent/1.0"
 
+    def log_message(self, format: str, *args) -> None:
+        logger.info("%s - %s", self.address_string(), format % args)
 
-def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {AGENT_TOKEN}"}
+    def _authorized(self) -> bool:
+        if not AGENT_TOKEN:
+            return False
+        auth = self.headers.get("Authorization", "")
+        return auth == f"Bearer {AGENT_TOKEN}"
 
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def register() -> bool:
-    payload = {
-        "name": AGENT_NAME,
-        "hostname": socket.gethostname(),
-    }
-    try:
-        with httpx.Client(timeout=15.0) as client:
-            response = client.post(
-                _hub_url("/agent/register"),
-                headers=_headers(),
-                json=payload,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                logger.info("Registered as %s (id %s)", data.get("name"), data.get("id"))
-                return True
-            logger.error("Register failed (%s): %s", response.status_code, response.text)
-    except httpx.HTTPError as exc:
-        logger.error("Could not reach bot server: %s", exc)
-    return False
+    def _reject_unauthorized(self) -> None:
+        self._send_json(401, {"error": "unauthorized"})
 
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/health":
+            if not self._authorized():
+                self._reject_unauthorized()
+                return
+            self._send_json(200, {"status": "ok"})
+            return
 
-def push_snapshot() -> bool:
-    snapshot = sample_resources(DISK_PATH, 1.0)
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(
-                _hub_url("/agent/push"),
-                headers=_headers(),
-                json=snapshot_to_dict(snapshot),
-            )
-            if response.status_code == 200:
-                return True
-            logger.warning("Push rejected (%s): %s", response.status_code, response.text)
-    except httpx.HTTPError as exc:
-        logger.error("Push failed: %s", exc)
-    return False
+        if path == "/status":
+            if not self._authorized():
+                self._reject_unauthorized()
+                return
+            try:
+                snapshot = sample_resources(DISK_PATH, 1.0)
+                self._send_json(200, snapshot_to_dict(snapshot))
+            except Exception as exc:
+                logger.exception("Failed to sample resources")
+                self._send_json(500, {"error": str(exc)})
+            return
+
+        self._send_json(404, {"error": "not found"})
 
 
 def main() -> None:
     if not AGENT_TOKEN:
         raise SystemExit("Set AGENT_TOKEN in .env")
-    if not AGENT_NAME:
-        raise SystemExit("Set AGENT_NAME in .env")
-    if not BOT_SERVER_HOST:
-        raise SystemExit("Set BOT_SERVER_HOST in .env (IP or hostname of the bot server)")
 
-    logger.info(
-        "Agent %s connecting to %s:%s every %ss",
-        AGENT_NAME,
-        BOT_SERVER_HOST,
-        BOT_SERVER_PORT,
-        PUSH_INTERVAL,
-    )
-
-    while not register():
-        logger.info("Retry register in 10s ...")
-        time.sleep(10)
-
-    while True:
-        if not push_snapshot():
-            logger.info("Retry register after push failure ...")
-            register()
-        time.sleep(PUSH_INTERVAL)
+    server = ThreadingHTTPServer((AGENT_HOST, AGENT_PORT), AgentHandler)
+    logger.info("Agent listening on %s:%s", AGENT_HOST, AGENT_PORT)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Agent stopped")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
