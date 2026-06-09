@@ -120,10 +120,70 @@ def _format_uptime(seconds: float) -> str:
     return " ".join(parts)
 
 
-def format_status(snapshot: ResourceSnapshot) -> str:
+def snapshot_to_dict(snapshot: ResourceSnapshot) -> dict:
+    return {
+        "cpu_percent_per_core": snapshot.cpu_percent_per_core,
+        "cpu_percent_avg": snapshot.cpu_percent_avg,
+        "ram_total_gb": snapshot.ram_total_gb,
+        "ram_used_gb": snapshot.ram_used_gb,
+        "ram_percent": snapshot.ram_percent,
+        "swap_used_gb": snapshot.swap_used_gb,
+        "swap_total_gb": snapshot.swap_total_gb,
+        "swap_percent": snapshot.swap_percent,
+        "disk_total_gb": snapshot.disk_total_gb,
+        "disk_used_gb": snapshot.disk_used_gb,
+        "disk_percent": snapshot.disk_percent,
+        "disk_path": snapshot.disk_path,
+        "hostname": snapshot.hostname,
+        "load_avg": list(snapshot.load_avg) if snapshot.load_avg else None,
+        "uptime_seconds": snapshot.uptime_seconds,
+        "top_ram_processes": [
+            {"name": p.name, "pid": p.pid, "value": p.value}
+            for p in snapshot.top_ram_processes
+        ],
+        "top_cpu_processes": [
+            {"name": p.name, "pid": p.pid, "value": p.value}
+            for p in snapshot.top_cpu_processes
+        ],
+    }
+
+
+def snapshot_from_dict(data: dict) -> ResourceSnapshot:
+    load_avg = data.get("load_avg")
+    return ResourceSnapshot(
+        cpu_percent_per_core=[float(v) for v in data["cpu_percent_per_core"]],
+        cpu_percent_avg=float(data["cpu_percent_avg"]),
+        ram_total_gb=float(data["ram_total_gb"]),
+        ram_used_gb=float(data["ram_used_gb"]),
+        ram_percent=float(data["ram_percent"]),
+        swap_used_gb=float(data["swap_used_gb"]),
+        swap_total_gb=float(data["swap_total_gb"]),
+        swap_percent=float(data["swap_percent"]),
+        disk_total_gb=float(data["disk_total_gb"]),
+        disk_used_gb=float(data["disk_used_gb"]),
+        disk_percent=float(data["disk_percent"]),
+        disk_path=str(data["disk_path"]),
+        hostname=str(data["hostname"]),
+        load_avg=tuple(load_avg) if load_avg else None,
+        uptime_seconds=float(data["uptime_seconds"]),
+        top_ram_processes=[
+            ProcessUsage(name=p["name"], pid=int(p["pid"]), value=float(p["value"]))
+            for p in data.get("top_ram_processes", [])
+        ],
+        top_cpu_processes=[
+            ProcessUsage(name=p["name"], pid=int(p["pid"]), value=float(p["value"]))
+            for p in data.get("top_cpu_processes", [])
+        ],
+    )
+
+
+def format_status(snapshot: ResourceSnapshot, *, display_name: str | None = None) -> str:
+    title = display_name or snapshot.hostname
     core_lines = ", ".join(f"{value:.0f}%" for value in snapshot.cpu_percent_per_core)
     lines = [
-        f"🖥 Server: {snapshot.hostname} ({platform.system()})",
+        f"🖥 {title} ({snapshot.hostname}, {platform.system()})"
+        if display_name
+        else f"🖥 Server: {snapshot.hostname} ({platform.system()})",
         f"Uptime: {_format_uptime(snapshot.uptime_seconds)}",
         "",
         f"CPU average: {snapshot.cpu_percent_avg:.1f}%",

@@ -1,6 +1,7 @@
 # Secrets
 .env
 allowed_users.json
+servers.json
 
 # Python
 __pycache__/

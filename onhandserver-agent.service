@@ -1,0 +1,15 @@
+[Unit]
+Description=OnHandServer stats agent (remote host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/onhandserver
+EnvironmentFile=/opt/onhandserver/.env
+ExecStart=/opt/onhandserver/venv/bin/python /opt/onhandserver/agent.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

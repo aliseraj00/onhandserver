@@ -50,8 +50,11 @@ fi
 echo "Installing to ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 cp -r "${SCRIPT_DIR}/bot.py" \
+      "${SCRIPT_DIR}/agent.py" \
       "${SCRIPT_DIR}/allowed_users.py" \
       "${SCRIPT_DIR}/config_store.py" \
+      "${SCRIPT_DIR}/servers_store.py" \
+      "${SCRIPT_DIR}/remote_client.py" \
       "${SCRIPT_DIR}/system_stats.py" \
       "${SCRIPT_DIR}/requirements.txt" \
       "${SCRIPT_DIR}/monitor_config.json" \

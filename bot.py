@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -11,7 +12,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from allowed_users import AllowedUsersStore
 from config_store import ConfigStore
-from system_stats import format_status, sample_resources
+from remote_client import RemoteAgentError, fetch_remote_status, ping_agent
+from servers_store import ServersStore
+from system_stats import ResourceSnapshot, format_status, sample_resources
 
 load_dotenv()
 
@@ -23,8 +26,14 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "monitor_config.json"
 ALLOWED_USERS_PATH = Path(__file__).resolve().parent / "allowed_users.json"
+SERVERS_PATH = Path(__file__).resolve().parent / "servers.json"
 config = ConfigStore(CONFIG_PATH)
 allowed_users = AllowedUsersStore(ALLOWED_USERS_PATH)
+servers = ServersStore(SERVERS_PATH)
+
+LOCAL_SERVER_ID = "__local__"
+MONITOR_LOCAL = os.getenv("MONITOR_LOCAL", "true").lower() in ("1", "true", "yes")
+LOCAL_SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
 
 
 def _parse_chat_ids(env_name: str) -> set[int]:
@@ -41,7 +50,7 @@ ADMIN_CHAT_IDS = _parse_chat_ids("ADMIN_CHAT_IDS") or _parse_chat_ids(
 )
 
 # Runtime alert state (not persisted)
-_cpu_high_streak = 0
+_cpu_high_streak: dict[str, int] = {}
 _last_alert_at: dict[str, float] = {}
 
 
@@ -62,6 +71,57 @@ def _authorized(update: Update) -> bool:
 def _is_admin(update: Update) -> bool:
     chat_id = _chat_id(update)
     return chat_id is not None and chat_id in ADMIN_CHAT_IDS
+
+
+def _local_display_name() -> str:
+    return LOCAL_SERVER_NAME or socket.gethostname()
+
+
+def _monitor_target_ids() -> list[str]:
+    targets: list[str] = []
+    if MONITOR_LOCAL:
+        targets.append(LOCAL_SERVER_ID)
+    targets.extend(server["id"] for server in servers.servers)
+    return targets
+
+
+def _resolve_server_id(name: str) -> str | None:
+    if name.lower() == "local" and MONITOR_LOCAL:
+        return LOCAL_SERVER_ID
+    match = servers.get_by_name(name)
+    return match["id"] if match else None
+
+
+def _server_label(server_id: str) -> str:
+    if server_id == LOCAL_SERVER_ID:
+        return _local_display_name()
+    entry = servers.get(server_id)
+    return entry["name"] if entry else server_id
+
+
+def _resolve_selection(chat_id: int | None) -> str | None:
+    if chat_id is not None:
+        selected = servers.get_selection(chat_id)
+        if selected and (
+            selected == LOCAL_SERVER_ID
+            or servers.get(selected) is not None
+        ):
+            return selected
+    targets = _monitor_target_ids()
+    if len(targets) == 1:
+        return targets[0]
+    return None
+
+
+async def _fetch_status(server_id: str) -> ResourceSnapshot:
+    if server_id == LOCAL_SERVER_ID:
+        return await asyncio.to_thread(
+            sample_resources, config.data["disk_path"], 1.0
+        )
+    entry = servers.get(server_id)
+    if entry is None:
+        raise RemoteAgentError("Server not found")
+    return await fetch_remote_status(entry["url"], entry["token"])
 
 
 async def _deny(update: Update) -> None:
@@ -186,7 +246,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
         "Server resource monitor\n\n"
         "Commands:\n"
-        "/status - current CPU, RAM, disk usage\n"
+        "/status - CPU, RAM, disk for selected server\n"
+        "/status all - brief overview of every server\n"
+        "/servers - list servers and your current selection\n"
+        "/use <name> - select server (use 'local' for this host)\n"
         "/config - show alert thresholds\n"
         "/alerts on|off - enable or disable alerts\n"
         "/setcpu <percent> - CPU alert when all cores stay high\n"
@@ -204,19 +267,161 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "\n\nAdmin:\n"
             "/adduser <id> - allow a user to use the bot\n"
             "/removeuser <id> - revoke access\n"
-            "/users - list allowed users"
+            "/users - list allowed users\n"
+            "/addserver <name> <url> [token] - register a remote agent\n"
+            "/removeserver <name> - unregister a remote server\n"
+            "/renameserver <old> <new> - rename a server"
         )
     await update.message.reply_text(help_text)
+
+
+async def list_servers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+    chat_id = _chat_id(update)
+    selected = _resolve_selection(chat_id)
+    lines = ["Registered servers\n"]
+    if MONITOR_LOCAL:
+        marker = " ← selected" if selected == LOCAL_SERVER_ID else ""
+        lines.append(f"  local — {_local_display_name()}{marker}")
+    remote = servers.servers
+    if remote:
+        for entry in remote:
+            marker = " ← selected" if selected == entry["id"] else ""
+            online = await ping_agent(entry["url"], entry["token"])
+            state = "online" if online else "offline"
+            lines.append(f"  {entry['name']} — {state}{marker}")
+    elif not MONITOR_LOCAL:
+        lines.append("  (none — add with /addserver)")
+    if len(_monitor_target_ids()) > 1 and selected is None:
+        lines.append("\nUse /use <name> to pick a server for /status.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def use_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /use <name>  (use 'local' for this host)")
+        return
+    server_id = _resolve_server_id(context.args[0])
+    if server_id is None:
+        await update.message.reply_text(f"Unknown server: {context.args[0]}")
+        return
+    chat_id = _chat_id(update)
+    if chat_id is None:
+        return
+    servers.set_selection(chat_id, server_id)
+    await update.message.reply_text(f"Selected server: {_server_label(server_id)}")
+
+
+async def add_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if len(context.args) not in {2, 3}:
+        await update.message.reply_text(
+            "Usage: /addserver <name> <url> [token]\n"
+            "Example: /addserver prod http://10.0.0.5:8765 my-secret-token"
+        )
+        return
+    name, url = context.args[0], context.args[1]
+    token = context.args[2] if len(context.args) == 3 else ServersStore.generate_token()
+    try:
+        entry = servers.add(name, url, token)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    online = await ping_agent(entry["url"], entry["token"])
+    status_text = "reachable" if online else "not reachable (check URL, firewall, agent)"
+    await update.message.reply_text(
+        f"Added server {entry['name']}\n"
+        f"URL: {entry['url']}\n"
+        f"Token: {entry['token']}\n"
+        f"Agent: {status_text}\n\n"
+        "Set the same AGENT_TOKEN on the remote host's .env."
+    )
+
+
+async def remove_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /removeserver <name>")
+        return
+    if servers.remove(context.args[0]):
+        await update.message.reply_text(f"Removed server {context.args[0]}.")
+    else:
+        await update.message.reply_text(f"Server not found: {context.args[0]}")
+
+
+async def rename_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /renameserver <old_name> <new_name>")
+        return
+    try:
+        if servers.rename(context.args[0], context.args[1]):
+            await update.message.reply_text(
+                f"Renamed {context.args[0]} → {context.args[1]}."
+            )
+        else:
+            await update.message.reply_text(f"Server not found: {context.args[0]}")
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         await _deny(update)
         return
-    snapshot = await asyncio.to_thread(
-        sample_resources, config.data["disk_path"], 1.0
+    if context.args and context.args[0].lower() == "all":
+        targets = _monitor_target_ids()
+        if not targets:
+            await update.message.reply_text("No servers configured.")
+            return
+        lines = ["All servers\n"]
+        for server_id in targets:
+            label = _server_label(server_id)
+            try:
+                snapshot = await _fetch_status(server_id)
+                lines.append(
+                    f"{label}: CPU {snapshot.cpu_percent_avg:.0f}%, "
+                    f"RAM {snapshot.ram_percent:.0f}%, "
+                    f"Disk {snapshot.disk_percent:.0f}%"
+                )
+            except RemoteAgentError:
+                lines.append(f"{label}: unreachable")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    server_id = _resolve_selection(_chat_id(update))
+    if server_id is None:
+        await update.message.reply_text(
+            "Multiple servers available. Use /servers to list them, "
+            "then /use <name> to select one.\n"
+            "Or send /status all for a quick overview."
+        )
+        return
+    try:
+        snapshot = await _fetch_status(server_id)
+    except RemoteAgentError as exc:
+        await update.message.reply_text(
+            f"Could not reach {_server_label(server_id)}: {exc}"
+        )
+        return
+    label = _server_label(server_id)
+    display_name = (
+        None if server_id == LOCAL_SERVER_ID and not LOCAL_SERVER_NAME else label
     )
-    await update.message.reply_text(format_status(snapshot))
+    await update.message.reply_text(
+        format_status(snapshot, display_name=display_name)
+    )
 
 
 async def show_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -408,8 +613,7 @@ def _can_send_alert(alert_key: str, cooldown: int) -> bool:
     return True
 
 
-def _evaluate_alerts(snapshot) -> list[str]:
-    global _cpu_high_streak
+def _evaluate_alerts(snapshot: ResourceSnapshot, server_id: str, label: str) -> list[str]:
     data = config.data
     messages: list[str] = []
     cooldown = int(data["alert_cooldown_seconds"])
@@ -419,20 +623,23 @@ def _evaluate_alerts(snapshot) -> list[str]:
     all_cores_high = bool(snapshot.cpu_percent_per_core) and all(
         core >= cpu_threshold for core in snapshot.cpu_percent_per_core
     )
+    streak = _cpu_high_streak.get(server_id, 0)
     if all_cores_high:
-        _cpu_high_streak += 1
+        streak += 1
     else:
-        _cpu_high_streak = 0
+        streak = 0
+    _cpu_high_streak[server_id] = streak
 
-    if _cpu_high_streak >= sustained and _can_send_alert("cpu", cooldown):
+    if streak >= sustained and _can_send_alert(f"{server_id}:cpu", cooldown):
         cores = ", ".join(f"{v:.0f}%" for v in snapshot.cpu_percent_per_core)
         messages.append(
-            f"🚨 CPU alert on {snapshot.hostname}\n"
+            f"🚨 CPU alert on {label}\n"
+            f"Host: {snapshot.hostname}\n"
             f"All cores >= {cpu_threshold:.0f}% for {sustained} checks.\n"
             f"Cores: {cores}\n"
             f"Average: {snapshot.cpu_percent_avg:.1f}%"
         )
-        _cpu_high_streak = 0
+        _cpu_high_streak[server_id] = 0
 
     ram_percent_limit = data["ram_threshold_percent"]
     ram_gb_limit = data["ram_threshold_gb"]
@@ -448,17 +655,19 @@ def _evaluate_alerts(snapshot) -> list[str]:
     else:
         reason = ""
 
-    if ram_triggered and _can_send_alert("ram", cooldown):
+    if ram_triggered and _can_send_alert(f"{server_id}:ram", cooldown):
         messages.append(
-            f"🚨 RAM alert on {snapshot.hostname}\n"
+            f"🚨 RAM alert on {label}\n"
+            f"Host: {snapshot.hostname}\n"
             f"{reason}\n"
             f"Total: {snapshot.ram_total_gb:.2f} GB"
         )
 
     disk_limit = float(data["disk_threshold_percent"])
-    if snapshot.disk_percent >= disk_limit and _can_send_alert("disk", cooldown):
+    if snapshot.disk_percent >= disk_limit and _can_send_alert(f"{server_id}:disk", cooldown):
         messages.append(
-            f"🚨 Disk alert on {snapshot.hostname}\n"
+            f"🚨 Disk alert on {label}\n"
+            f"Host: {snapshot.hostname}\n"
             f"Path {snapshot.disk_path}: {snapshot.disk_percent:.1f}% used "
             f"({snapshot.disk_used_gb:.2f} / {snapshot.disk_total_gb:.2f} GB)"
         )
@@ -469,15 +678,21 @@ def _evaluate_alerts(snapshot) -> list[str]:
 async def monitor_loop(application: Application) -> None:
     while True:
         config.load()
+        servers.load()
         interval = int(config.data["check_interval_seconds"])
         try:
             if config.data["alerts_enabled"]:
-                snapshot = await asyncio.to_thread(
-                    sample_resources, config.data["disk_path"], 1.0
-                )
-                alerts = _evaluate_alerts(snapshot)
+                all_alerts: list[str] = []
+                for server_id in _monitor_target_ids():
+                    label = _server_label(server_id)
+                    try:
+                        snapshot = await _fetch_status(server_id)
+                    except RemoteAgentError:
+                        logger.warning("Monitor: could not reach %s", label)
+                        continue
+                    all_alerts.extend(_evaluate_alerts(snapshot, server_id, label))
                 for chat_id in _allowed_chat_ids():
-                    for text in alerts:
+                    for text in all_alerts:
                         try:
                             await application.bot.send_message(
                                 chat_id=chat_id, text=text
@@ -514,6 +729,11 @@ def main() -> None:
     application.add_handler(CommandHandler("users", list_users))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
+    application.add_handler(CommandHandler("servers", list_servers))
+    application.add_handler(CommandHandler("use", use_server))
+    application.add_handler(CommandHandler("addserver", add_server))
+    application.add_handler(CommandHandler("removeserver", remove_server))
+    application.add_handler(CommandHandler("renameserver", rename_server))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("config", show_config))
     application.add_handler(CommandHandler("alerts", set_alerts))
