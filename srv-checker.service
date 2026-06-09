@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram server resource monitor bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/srv_checker
+EnvironmentFile=/opt/srv_checker/.env
+ExecStart=/opt/srv_checker/venv/bin/python /opt/srv_checker/bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
