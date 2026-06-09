@@ -227,3 +227,27 @@ def format_status(snapshot: ResourceSnapshot, *, display_name: str | None = None
         lines.append("  (none)")
 
     return "\n".join(lines)
+
+
+def format_top_processes_block(
+    snapshot: ResourceSnapshot, *, kind: str, limit: int = 2
+) -> str:
+    if kind == "cpu":
+        procs = snapshot.top_cpu_processes[:limit]
+        if not procs:
+            return ""
+        lines = ["", "Top CPU apps:"]
+        for proc in procs:
+            lines.append(f"  • {proc.name} ({proc.pid}): {proc.value:.1f}%")
+        return "\n".join(lines)
+
+    if kind == "ram":
+        procs = snapshot.top_ram_processes[:limit]
+        if not procs:
+            return ""
+        lines = ["", "Top RAM apps:"]
+        for proc in procs:
+            lines.append(f"  • {proc.name} ({proc.pid}): {proc.value:.2f} GB")
+        return "\n".join(lines)
+
+    return ""

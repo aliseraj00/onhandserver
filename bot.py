@@ -22,7 +22,12 @@ from allowed_users import AllowedUsersStore
 from config_store import ConfigStore
 from remote_client import RemoteAgentError, fetch_remote_status, ping_agent
 from servers_store import ServersStore
-from system_stats import ResourceSnapshot, format_status, sample_resources
+from system_stats import (
+    ResourceSnapshot,
+    format_status,
+    format_top_processes_block,
+    sample_resources,
+)
 
 load_dotenv()
 
@@ -195,11 +200,13 @@ def _format_server_alerts(server_id: str) -> str:
 
 def _format_global_alerts() -> str:
     data = config.data
+    show_top = data.get("alert_show_top_processes", True)
     return (
         "⏱ Global monitoring\n\n"
         f"Check interval: {data['check_interval_seconds']}s\n"
         f"Alert cooldown: {data['alert_cooldown_seconds']}s\n"
-        f"Local disk path: {data['disk_path']}\n\n"
+        f"Local disk path: {data['disk_path']}\n"
+        f"Show top apps in alerts: {_on_off(show_top)}\n\n"
         "These apply to all servers."
     )
 
@@ -387,8 +394,19 @@ def _disk_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
 
 
 def _global_alert_keyboard() -> InlineKeyboardMarkup:
+    show_top = config.data.get("alert_show_top_processes", True)
+    top_label = (
+        "📋 Top apps in alerts: ON ✅"
+        if show_top
+        else "📋 Top apps in alerts: OFF ❌"
+    )
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    top_label, callback_data=_cb("al", "g", "top", "t")
+                )
+            ],
             [
                 InlineKeyboardButton("Every 30s", callback_data=_cb("al", "g", "i", "30")),
                 InlineKeyboardButton("Every 60s", callback_data=_cb("al", "g", "i", "60")),
@@ -832,6 +850,12 @@ async def _handle_global_alert_callback(
 
     if parts[0] == "cd" and len(parts) > 1:
         config.update_global(alert_cooldown_seconds=int(parts[1]))
+        await _show_global_alerts(update)
+        return
+
+    if parts[0] == "top" and len(parts) > 1 and parts[1] == "t":
+        current = config.data.get("alert_show_top_processes", True)
+        config.update_global(alert_show_top_processes=not current)
         await _show_global_alerts(update)
         return
 
@@ -1407,6 +1431,7 @@ def _evaluate_alerts(
 
     messages: list[str] = []
     cooldown = int(config.data["alert_cooldown_seconds"])
+    show_top = config.data.get("alert_show_top_processes", True)
 
     if cfg["cpu_enabled"]:
         cpu_threshold = float(cfg["cpu_threshold_percent"])
@@ -1423,13 +1448,16 @@ def _evaluate_alerts(
 
         if streak >= sustained and _can_send_alert(f"{server_id}:cpu", cooldown):
             cores = ", ".join(f"{v:.0f}%" for v in snapshot.cpu_percent_per_core)
-            messages.append(
+            text = (
                 f"🚨 CPU alert on {label}\n"
                 f"Host: {snapshot.hostname}\n"
                 f"All cores >= {cpu_threshold:.0f}% for {sustained} checks.\n"
                 f"Cores: {cores}\n"
                 f"Average: {snapshot.cpu_percent_avg:.1f}%"
             )
+            if show_top:
+                text += format_top_processes_block(snapshot, kind="cpu")
+            messages.append(text)
             _cpu_high_streak[server_id] = 0
     else:
         _cpu_high_streak[server_id] = 0
@@ -1455,12 +1483,15 @@ def _evaluate_alerts(
             reason = ""
 
         if ram_triggered and _can_send_alert(f"{server_id}:ram", cooldown):
-            messages.append(
+            text = (
                 f"🚨 RAM alert on {label}\n"
                 f"Host: {snapshot.hostname}\n"
                 f"{reason}\n"
                 f"Total: {snapshot.ram_total_gb:.2f} GB"
             )
+            if show_top:
+                text += format_top_processes_block(snapshot, kind="ram")
+            messages.append(text)
 
     if cfg["disk_enabled"]:
         disk_limit = float(cfg["disk_threshold_percent"])

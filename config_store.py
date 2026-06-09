@@ -22,6 +22,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "check_interval_seconds": 30,
     "alert_cooldown_seconds": 300,
     "disk_path": _DEFAULT_DISK_PATH,
+    "alert_show_top_processes": True,
     "server_alerts": {},
 }
 
