@@ -170,59 +170,24 @@ async def _execute_on_server(server_id: str, command: str) -> CommandResult:
     )
 
 
-def _exec_server_keyboard() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if MONITOR_LOCAL:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    _local_display_name() + " (local)",
-                    callback_data=_cb("exec", "s", LOCAL_SERVER_ID),
-                )
-            ]
-        )
-    for entry in servers.ready_servers:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    entry["name"],
-                    callback_data=_cb("exec", "s", entry["id"]),
-                )
-            ]
-        )
-    rows.append([_back_button()])
-    return InlineKeyboardMarkup(rows)
+def _exec_back_keyboard(server_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◀️ Back", callback_data=_cb("pick", server_id))]]
+    )
 
 
-async def _show_exec_picker(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not _is_admin(update):
+async def _show_server_actions(update: Update, server_id: str) -> None:
+    if not _authorized(update):
         await _deny(update)
         return
-    if not EXEC_ENABLED:
-        await _send_or_edit(
-            update,
-            "Run command is disabled on this bot.\n"
-            "Enable EXEC_ENABLED in .env and run install.sh --upgrade.",
-            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
-        )
-        return
-    targets = _monitor_target_ids()
-    if not targets:
-        await _send_or_edit(
-            update,
-            "No servers available to run commands on.",
-            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
-        )
-        return
-    if len(targets) == 1:
-        await _prompt_exec_command(update, context, targets[0])
-        return
+    label = _server_label(server_id)
+    lines = [f"Server: {label}", "", "Choose an action:"]
+    if _is_admin(update) and not EXEC_ENABLED:
+        lines.append("\nShell commands are disabled (EXEC_ENABLED=false).")
     await _send_or_edit(
         update,
-        "Run command\n\nPick the server to run on:",
-        reply_markup=_exec_server_keyboard(),
+        "\n".join(lines),
+        reply_markup=_server_actions_keyboard(server_id, update),
     )
 
 
@@ -231,6 +196,17 @@ async def _prompt_exec_command(
     context: ContextTypes.DEFAULT_TYPE | None,
     server_id: str,
 ) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if not EXEC_ENABLED:
+        await _send_or_edit(
+            update,
+            "Run command is disabled.\n"
+            "Enable EXEC_ENABLED in .env and run install.sh --upgrade.",
+            reply_markup=_exec_back_keyboard(server_id),
+        )
+        return
     if context is not None:
         _set_awaiting(context, "exec", server_id=server_id)
     label = _server_label(server_id)
@@ -242,7 +218,7 @@ async def _prompt_exec_command(
         "  df -h\n"
         "  systemctl status nginx\n"
         "  docker ps",
-        reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+        reply_markup=_exec_back_keyboard(server_id),
     )
 
 
@@ -261,6 +237,9 @@ async def _run_exec_for_admin(
     try:
         result = await _execute_on_server(server_id, command)
     except RemoteAgentError as exc:
+        back_btn = InlineKeyboardButton(
+            "◀️ Back to server", callback_data=_cb("pick", server_id)
+        )
         await _send_or_edit(
             update,
             f"Could not run command on {label}: {exc}",
@@ -272,13 +251,16 @@ async def _run_exec_for_admin(
                             callback_data=_cb("exec", "s", server_id),
                         )
                     ],
-                    [_back_button()],
+                    [back_btn],
                 ]
             ),
         )
         return
 
     text = format_command_result(label=label, command=command, result=result)
+    back_btn = InlineKeyboardButton(
+        "◀️ Back to server", callback_data=_cb("pick", server_id)
+    )
     await _send_or_edit(
         update,
         text,
@@ -290,7 +272,7 @@ async def _run_exec_for_admin(
                         callback_data=_cb("exec", "s", server_id),
                     )
                 ],
-                [_back_button()],
+                [back_btn],
             ]
         ),
         prefer_new=True,
@@ -325,10 +307,6 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))],
     ]
     if _is_admin(update):
-        if EXEC_ENABLED:
-            rows.append(
-                [InlineKeyboardButton("⌨️ Run command", callback_data=_cb("exec"))]
-            )
         rows.append(
             [
                 InlineKeyboardButton("👤 Users", callback_data=_cb("admin", "users")),
@@ -347,24 +325,15 @@ def _on_off(enabled: bool) -> str:
 def _format_server_alerts(server_id: str) -> str:
     cfg = config.get_server_alerts(server_id)
     label = _server_label(server_id)
-    ram_pct = cfg["ram_threshold_percent"]
-    ram_gb = cfg["ram_threshold_gb"]
-    ram_lines: list[str] = []
-    if ram_pct is not None:
-        ram_lines.append(f"  • Percent: {ram_pct:.0f}%")
-    if ram_gb is not None:
-        ram_lines.append(f"  • Used GB: {ram_gb:.2f} GB")
-    if not ram_lines:
-        ram_lines.append("  • (set a threshold below)")
 
     return (
         f"🔔 Alerts — {label}\n\n"
         f"Master switch: {_on_off(cfg['enabled'])}\n\n"
         f"CPU: {_on_off(cfg['cpu_enabled'])} — "
         f"{cfg['cpu_threshold_percent']:.0f}% for {cfg['cpu_sustained_checks']} checks\n"
-        f"RAM: {_on_off(cfg['ram_enabled'])}\n"
-        + "\n".join(ram_lines)
-        + f"\nDisk: {_on_off(cfg['disk_enabled'])} — "
+        f"RAM: {_on_off(cfg['ram_enabled'])} — "
+        f"{cfg['ram_threshold_percent']:.0f}%\n"
+        f"Disk: {_on_off(cfg['disk_enabled'])} — "
         f"{cfg['disk_threshold_percent']:.0f}% used\n\n"
         "Toggle resources below, or tap one to set thresholds."
     )
@@ -519,20 +488,11 @@ def _ram_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("80%", callback_data=_cb("al", "s", server_id, "r", "p", "80")),
                 InlineKeyboardButton("90%", callback_data=_cb("al", "s", server_id, "r", "p", "90")),
-                InlineKeyboardButton("% off", callback_data=_cb("al", "s", server_id, "r", "p", "0")),
-            ],
-            [
-                InlineKeyboardButton("4 GB", callback_data=_cb("al", "s", server_id, "r", "g", "4")),
-                InlineKeyboardButton("8 GB", callback_data=_cb("al", "s", server_id, "r", "g", "8")),
-                InlineKeyboardButton("16 GB", callback_data=_cb("al", "s", server_id, "r", "g", "16")),
-                InlineKeyboardButton("GB off", callback_data=_cb("al", "s", server_id, "r", "g", "0")),
+                InlineKeyboardButton("95%", callback_data=_cb("al", "s", server_id, "r", "p", "95")),
             ],
             [
                 InlineKeyboardButton(
                     "✏️ Custom %", callback_data=_cb("al", "s", server_id, "r", "u", "p")
-                ),
-                InlineKeyboardButton(
-                    "✏️ Custom GB", callback_data=_cb("al", "s", server_id, "r", "u", "g")
                 ),
             ],
             [_back_button("al", "s", server_id)],
@@ -634,6 +594,32 @@ async def _servers_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _server_actions_keyboard(server_id: str, update: Update) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                "📊 Status", callback_data=_cb("status", server_id)
+            )
+        ],
+    ]
+    if _is_admin(update) and EXEC_ENABLED:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⌨️ Run command",
+                    callback_data=_cb("exec", "s", server_id),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("🖥 Servers", callback_data=_cb("servers")),
+            _back_button(),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def _admin_servers_keyboard() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for entry in servers.servers:
@@ -684,17 +670,14 @@ def _status_actions_keyboard(
             _back_button(),
         ],
     ]
-    if server_id and update and _is_admin(update) and EXEC_ENABLED:
-        rows.insert(
-            1,
-            [
-                InlineKeyboardButton(
-                    "⌨️ Run command",
-                    callback_data=_cb("exec", "s", server_id),
-                )
-            ],
-        )
     if server_id:
+        rows[1].insert(
+            0,
+            InlineKeyboardButton(
+                "◀️ Server menu",
+                callback_data=_cb("pick", server_id),
+            ),
+        )
         rows[0].insert(
             0,
             InlineKeyboardButton(
@@ -859,7 +842,7 @@ async def _show_servers(update: Update) -> None:
         return
     chat_id = _chat_id(update)
     selected = _resolve_selection(chat_id)
-    lines = ["Registered servers\nTap a server to select it and view status.\n"]
+    lines = ["Registered servers\nTap a server to open its menu.\n"]
     if MONITOR_LOCAL:
         marker = " ← selected" if selected == LOCAL_SERVER_ID else ""
         lines.append(f"  local — {_local_display_name()}{marker}")
@@ -886,7 +869,7 @@ async def _pick_server(update: Update, server_id: str) -> None:
         await _show_servers(update)
         return
     servers.set_selection(chat_id, server_id)
-    await _show_status(update, server_id)
+    await _show_server_actions(update, server_id)
 
 
 async def _show_settings(update: Update) -> None:
@@ -931,14 +914,10 @@ async def _show_cpu_alerts(update: Update, server_id: str) -> None:
 
 async def _show_ram_alerts(update: Update, server_id: str) -> None:
     cfg = config.get_server_alerts(server_id)
-    pct = cfg["ram_threshold_percent"]
-    gb = cfg["ram_threshold_gb"]
     text = (
         f"RAM alerts — {_server_label(server_id)}\n\n"
         f"Status: {_on_off(cfg['ram_enabled'])}\n"
-        f"Percent: {f'{pct:.0f}%' if pct is not None else 'off'}\n"
-        f"Used GB: {f'{gb:.2f} GB' if gb is not None else 'off'}\n\n"
-        "Alert triggers if percent OR used GB threshold is exceeded."
+        f"Threshold: {cfg['ram_threshold_percent']:.0f}%"
     )
     await _send_or_edit(
         update, text, reply_markup=_ram_alert_keyboard(server_id)
@@ -1134,18 +1113,11 @@ async def _apply_ram_alert_change(
         return
 
     if parts[0] == "p" and len(parts) > 1:
-        val = float(parts[1])
-        changes: dict = {"ram_enabled": True}
-        changes["ram_threshold_percent"] = None if val == 0 else val
-        config.update_server_alerts(server_id, **changes)
-        await _show_ram_alerts(update, server_id)
-        return
-
-    if parts[0] == "g" and len(parts) > 1:
-        val = float(parts[1])
-        changes = {"ram_enabled": True}
-        changes["ram_threshold_gb"] = None if val == 0 else val
-        config.update_server_alerts(server_id, **changes)
+        config.update_server_alerts(
+            server_id,
+            ram_enabled=True,
+            ram_threshold_percent=float(parts[1]),
+        )
         await _show_ram_alerts(update, server_id)
         return
 
@@ -1155,16 +1127,7 @@ async def _apply_ram_alert_change(
             _set_awaiting(context, "al_cfg_ram_pct", server_id=server_id)
             await _send_or_edit(
                 update,
-                f"Send RAM threshold % for {_server_label(server_id)} (1–100, or 0 to disable):",
-                reply_markup=InlineKeyboardMarkup(
-                    [[_back_button("al", "s", server_id, "ram")]]
-                ),
-            )
-        elif kind == "g":
-            _set_awaiting(context, "al_cfg_ram_gb", server_id=server_id)
-            await _send_or_edit(
-                update,
-                f"Send RAM used GB threshold for {_server_label(server_id)} (>0, or 0 to disable):",
+                f"Send RAM threshold % for {_server_label(server_id)} (1–100):",
                 reply_markup=InlineKeyboardMarkup(
                     [[_back_button("al", "s", server_id, "ram")]]
                 ),
@@ -1408,41 +1371,16 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             value = float(text)
         except ValueError:
-            await update.message.reply_text("Enter a number.")
+            await update.message.reply_text("Enter a number between 1 and 100.")
             return
-        _clear_awaiting(context)
-        if value == 0:
-            config.update_server_alerts(server_id, ram_threshold_percent=None)
-            await update.message.reply_text("RAM percent alert disabled.")
-        elif 1 <= value <= 100:
-            config.update_server_alerts(
-                server_id, ram_enabled=True, ram_threshold_percent=value
-            )
-            await update.message.reply_text(f"RAM percent set to {value:.0f}%.")
-        else:
+        if not 1 <= value <= 100:
             await update.message.reply_text("Percent must be between 1 and 100.")
             return
-        await _show_ram_alerts(update, server_id)
-        return
-
-    if action == "al_cfg_ram_gb" and server_id:
-        try:
-            value = float(text)
-        except ValueError:
-            await update.message.reply_text("Enter a number.")
-            return
         _clear_awaiting(context)
-        if value == 0:
-            config.update_server_alerts(server_id, ram_threshold_gb=None)
-            await update.message.reply_text("RAM GB alert disabled.")
-        elif value > 0:
-            config.update_server_alerts(
-                server_id, ram_enabled=True, ram_threshold_gb=value
-            )
-            await update.message.reply_text(f"RAM GB threshold set to {value:.2f} GB.")
-        else:
-            await update.message.reply_text("GB must be greater than 0.")
-            return
+        config.update_server_alerts(
+            server_id, ram_enabled=True, ram_threshold_percent=value
+        )
+        await update.message.reply_text(f"RAM threshold set to {value:.0f}%.")
         await _show_ram_alerts(update, server_id)
         return
 
@@ -1555,7 +1493,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _prompt_exec_command(update, context, parts[2])
         else:
             _clear_awaiting(context)
-            await _show_exec_picker(update, context)
+            await _show_servers(update)
         return
 
     if action == "al":
@@ -1684,31 +1622,15 @@ def _evaluate_alerts(
         _cpu_high_streak[server_id] = 0
 
     if cfg["ram_enabled"]:
-        ram_percent_limit = cfg["ram_threshold_percent"]
-        ram_gb_limit = cfg["ram_threshold_gb"]
-        ram_triggered = False
-        if ram_percent_limit is not None and snapshot.ram_percent >= float(
-            ram_percent_limit
+        ram_limit = float(cfg["ram_threshold_percent"])
+        if snapshot.ram_percent >= ram_limit and _can_send_alert(
+            f"{server_id}:ram", cooldown
         ):
-            ram_triggered = True
-            reason = (
-                f"RAM usage {snapshot.ram_percent:.1f}% >= {ram_percent_limit:.0f}%"
-            )
-        elif ram_gb_limit is not None and snapshot.ram_used_gb >= float(ram_gb_limit):
-            ram_triggered = True
-            reason = (
-                f"RAM used {snapshot.ram_used_gb:.2f} GB "
-                f">= {float(ram_gb_limit):.2f} GB"
-            )
-        else:
-            reason = ""
-
-        if ram_triggered and _can_send_alert(f"{server_id}:ram", cooldown):
             text = (
                 f"🚨 RAM alert on {label}\n"
                 f"Host: {snapshot.hostname}\n"
-                f"{reason}\n"
-                f"Total: {snapshot.ram_total_gb:.2f} GB"
+                f"RAM usage {snapshot.ram_percent:.1f}% >= {ram_limit:.0f}%\n"
+                f"Used: {snapshot.ram_used_gb:.2f} / {snapshot.ram_total_gb:.2f} GB"
             )
             if show_top:
                 text += format_top_processes_block(snapshot, kind="ram")

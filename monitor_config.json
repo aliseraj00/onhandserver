@@ -4,8 +4,7 @@
   "alert_cooldown_seconds": 300,
   "cpu_threshold_percent": 90,
   "cpu_sustained_checks": 3,
-  "ram_threshold_percent": null,
-  "ram_threshold_gb": 8.0,
+  "ram_threshold_percent": 90,
   "disk_threshold_percent": 90,
   "disk_path": "/"
 }

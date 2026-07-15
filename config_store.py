@@ -12,8 +12,7 @@ SERVER_ALERT_DEFAULT: dict[str, Any] = {
     "cpu_threshold_percent": 90,
     "cpu_sustained_checks": 3,
     "ram_enabled": True,
-    "ram_threshold_percent": None,
-    "ram_threshold_gb": 8.0,
+    "ram_threshold_percent": 90,
     "disk_enabled": True,
     "disk_threshold_percent": 90,
 }
@@ -31,7 +30,6 @@ _LEGACY_ALERT_KEYS = (
     "cpu_threshold_percent",
     "cpu_sustained_checks",
     "ram_threshold_percent",
-    "ram_threshold_gb",
     "disk_threshold_percent",
 )
 
@@ -58,8 +56,7 @@ class ConfigStore:
             template["cpu_sustained_checks"] = stored.pop("cpu_sustained_checks")
         if "ram_threshold_percent" in stored:
             template["ram_threshold_percent"] = stored.pop("ram_threshold_percent")
-        if "ram_threshold_gb" in stored:
-            template["ram_threshold_gb"] = stored.pop("ram_threshold_gb")
+        stored.pop("ram_threshold_gb", None)
         if "disk_threshold_percent" in stored:
             template["disk_threshold_percent"] = stored.pop("disk_threshold_percent")
 
@@ -68,6 +65,15 @@ class ConfigStore:
 
         stored["server_alerts"] = {"__default__": template}
         return stored
+
+    def _normalize_server_alerts(self) -> None:
+        server_alerts = self._data.get("server_alerts", {})
+        for entry in server_alerts.values():
+            entry.pop("ram_threshold_gb", None)
+            if entry.get("ram_threshold_percent") is None:
+                entry["ram_threshold_percent"] = SERVER_ALERT_DEFAULT[
+                    "ram_threshold_percent"
+                ]
 
     def load(self) -> None:
         if not self.path.exists():
@@ -80,6 +86,7 @@ class ConfigStore:
         merged.update({k: v for k, v in stored.items() if k != "server_alerts"})
         merged["server_alerts"] = stored.get("server_alerts", {})
         self._data = merged
+        self._normalize_server_alerts()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +105,11 @@ class ConfigStore:
         specific = self._data.get("server_alerts", {}).get(server_id)
         if specific:
             merged.update(specific)
+        merged.pop("ram_threshold_gb", None)
+        if merged.get("ram_threshold_percent") is None:
+            merged["ram_threshold_percent"] = SERVER_ALERT_DEFAULT[
+                "ram_threshold_percent"
+            ]
         return merged
 
     def update_server_alerts(self, server_id: str, **changes: Any) -> None:
