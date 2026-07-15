@@ -10,7 +10,7 @@ Telegram bot for monitoring CPU, RAM, and disk on Linux servers. Run the bot on 
 
 ## Quick install
 
-One-liner (like 3x-ui) — no manual clone required. Run as **root**:
+One-liner  — no manual clone required. Run as **root**:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/aliseraj00/onhandserver/main/install.sh)
@@ -94,7 +94,7 @@ Open your bot in Telegram and send `/start` (or `/help`).
 Example:
 
 ```text
-web1 | http://203.0.113.10:8765 | YOUR_AGENT_TOKEN
+web1 | http://x.x.x.x:xxxx | YOUR_AGENT_TOKEN
 ```
 
 The token must match the agent’s `AGENT_TOKEN`. If you omit the token, one is generated — then you must set the same value on the agent.
