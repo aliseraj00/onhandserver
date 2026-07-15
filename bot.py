@@ -21,10 +21,12 @@ from telegram.ext import (
 
 from allowed_users import AllowedUsersStore
 from backup_util import (
+    IMPORTANT_LINUX_LOGS,
     TELEGRAM_UPLOAD_LIMIT_BYTES,
     BackupError,
+    classify_log_path,
     create_backup_zip,
-    create_linux_logs_zip,
+    create_paths_zip,
     format_size,
     list_important_linux_logs,
 )
@@ -1018,59 +1020,126 @@ def _backup_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _format_linux_logs_text() -> str:
-    rows = list_important_linux_logs()
-    found = sum(1 for _p, status, _d in rows if status == "found")
-    denied = sum(1 for _p, status, _d in rows if status == "denied")
+def _format_linux_logs_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    found = _ensure_linux_log_selection(context)
+    selected = _linux_log_selection(context)
+    denied = sum(
+        1 for _p, status, _d in list_important_linux_logs() if status == "denied"
+    )
     limit_mb = TELEGRAM_UPLOAD_LIMIT_BYTES / (1024 * 1024)
     lines = [
         "📋 Important Linux logs\n",
-        f"Found readable: {found}  |  no access: {denied}",
+        f"Readable: {len(found)}  |  selected: {len(selected)}  |  no access: {denied}",
         f"Zip upload limit: {limit_mb:.0f} MB\n",
+        "Tap checkboxes below to choose which logs to upload.",
     ]
-    icons = {"found": "✅", "missing": "·", "denied": "🔒", "other": "⚠️"}
-    # Keep message under Telegram's 4096 char limit
-    for path, status, detail in rows:
-        icon = icons.get(status, "·")
-        if status == "found":
-            lines.append(f"{icon} {path} ({detail})")
-        elif status == "denied":
-            lines.append(f"{icon} {path}")
-        else:
-            lines.append(f"{icon} {path}")
-    lines.append(
-        "\nTap Upload to zip all readable files from this list and send to Telegram."
-    )
+    if not found:
+        lines.append(
+            "\nNo readable log files found. Run the bot as root (or a user "
+            "that can read /var/log)."
+        )
     text = "\n".join(lines)
     if len(text) > 4000:
-        text = text[:3970] + "\n…(list truncated)"
+        text = text[:3970] + "\n…(truncated)"
     return text
 
 
-def _linux_logs_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def _linux_log_short_name(path: str) -> str:
+    p = Path(path)
+    if p.parent == Path("/var/log"):
+        return p.name
+    return f"{p.parent.name}/{p.name}"
+
+
+def _linux_log_button_label(path: str, selected: bool, detail: str) -> str:
+    mark = "✅" if selected else "⬜"
+    short = _linux_log_short_name(path)
+    label = f"{mark} {short}"
+    if detail:
+        candidate = f"{label} ({detail})"
+        if len(candidate) <= 64:
+            return candidate
+    return label[:64]
+
+
+def _linux_logs_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    found = _ensure_linux_log_selection(context)
+    selected = _linux_log_selection(context)
+    path_to_idx = {path: idx for idx, path in enumerate(IMPORTANT_LINUX_LOGS)}
+    rows: list[list[InlineKeyboardButton]] = []
+    for path, detail in found:
+        idx = path_to_idx[path]
+        rows.append(
             [
                 InlineKeyboardButton(
-                    "📤 Upload found logs", callback_data=_cb("bk", "logs", "up")
+                    _linux_log_button_label(path, path in selected, detail),
+                    callback_data=_cb("bk", "logs", "t", str(idx)),
                 )
-            ],
+            ]
+        )
+    if found:
+        rows.append(
             [
-                InlineKeyboardButton("🔄 Refresh", callback_data=_cb("bk", "logs")),
-                InlineKeyboardButton("◀️ Back", callback_data=_cb("bk")),
-            ],
+                InlineKeyboardButton(
+                    "✅ Select all", callback_data=_cb("bk", "logs", "all")
+                ),
+                InlineKeyboardButton(
+                    "⬜ Clear", callback_data=_cb("bk", "logs", "none")
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📤 Upload selected ({len(selected)})",
+                    callback_data=_cb("bk", "logs", "up"),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=_cb("bk", "logs")),
+            InlineKeyboardButton("◀️ Back", callback_data=_cb("bk")),
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
-async def _show_linux_logs(update: Update) -> None:
+def _linux_log_selection(context: ContextTypes.DEFAULT_TYPE) -> set[str]:
+    sel = context.user_data.get("linux_log_selection")
+    if not isinstance(sel, set):
+        sel = set()
+        context.user_data["linux_log_selection"] = sel
+    return sel
+
+
+def _ensure_linux_log_selection(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> list[tuple[str, str]]:
+    """Return [(path, size_detail), ...] for readable logs; sync selection."""
+    found = [
+        (path, detail)
+        for path, status, detail in list_important_linux_logs()
+        if status == "found"
+    ]
+    found_paths = {path for path, _detail in found}
+    if "linux_log_selection" not in context.user_data:
+        context.user_data["linux_log_selection"] = set(found_paths)
+    else:
+        _linux_log_selection(context).intersection_update(found_paths)
+    return found
+
+
+async def _show_linux_logs(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     if not _is_admin(update):
         await _deny(update)
         return
     await _send_or_edit(
         update,
-        _format_linux_logs_text(),
-        reply_markup=_linux_logs_keyboard(),
+        _format_linux_logs_text(context),
+        reply_markup=_linux_logs_keyboard(context),
     )
 
 
@@ -1257,42 +1326,87 @@ async def _handle_backup_callback(
         return
 
     if action == "logs":
-        if len(parts) > 1 and parts[1] == "up":
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if sub == "t" and len(parts) > 2:
+            try:
+                idx = int(parts[2])
+            except ValueError:
+                await _show_linux_logs(update, context)
+                return
+            if 0 <= idx < len(IMPORTANT_LINUX_LOGS):
+                path = IMPORTANT_LINUX_LOGS[idx]
+                status, _detail = classify_log_path(path)
+                if status == "found":
+                    sel = _linux_log_selection(context)
+                    if path in sel:
+                        sel.discard(path)
+                    else:
+                        sel.add(path)
+            await _show_linux_logs(update, context)
+            return
+
+        if sub == "all":
+            found = _ensure_linux_log_selection(context)
+            _linux_log_selection(context).update(path for path, _d in found)
+            await _show_linux_logs(update, context)
+            return
+
+        if sub == "none":
+            _ensure_linux_log_selection(context)
+            _linux_log_selection(context).clear()
+            await _show_linux_logs(update, context)
+            return
+
+        if sub == "up":
             chat_id = _chat_id(update)
             query = update.callback_query
             if chat_id is None:
+                return
+            _ensure_linux_log_selection(context)
+            selected = sorted(_linux_log_selection(context))
+            if not selected:
+                if query:
+                    await query.answer(
+                        "Select at least one log first.", show_alert=True
+                    )
                 return
             if query:
                 await query.answer("Collecting logs…")
             await _send_or_edit(
                 update,
-                "📋 Zipping important Linux logs…\nPlease wait…",
-                reply_markup=_linux_logs_keyboard(),
+                f"📋 Zipping {len(selected)} selected log(s)…\nPlease wait…",
+                reply_markup=_linux_logs_keyboard(context),
             )
             try:
                 await _send_zip_document(
                     context.application.bot,
                     chat_id,
-                    zip_factory=create_linux_logs_zip,
+                    zip_factory=lambda: create_paths_zip(
+                        selected, prefix="linux_logs_"
+                    ),
                     filename_stem="linux_logs",
-                    caption="📋 Important Linux logs backup",
+                    caption="📋 Selected Linux logs backup",
                 )
-                await _show_linux_logs(update)
+                await _show_linux_logs(update, context)
             except BackupError as exc:
                 await _send_or_edit(
                     update,
                     f"❌ Logs upload failed:\n{exc}",
-                    reply_markup=_linux_logs_keyboard(),
+                    reply_markup=_linux_logs_keyboard(context),
                 )
             except Exception as exc:
                 logger.exception("Linux logs upload failed")
                 await _send_or_edit(
                     update,
                     f"❌ Logs upload failed:\n{exc}",
-                    reply_markup=_linux_logs_keyboard(),
+                    reply_markup=_linux_logs_keyboard(context),
                 )
             return
-        await _show_linux_logs(update)
+
+        # Fresh open / refresh — reselect all currently readable logs
+        context.user_data.pop("linux_log_selection", None)
+        await _show_linux_logs(update, context)
         return
 
     await _show_backup(update)
