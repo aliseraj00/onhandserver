@@ -239,6 +239,7 @@ copy_files() {
     cp "${SCRIPT_DIR}/bot.py" \
        "${SCRIPT_DIR}/agent.py" \
        "${SCRIPT_DIR}/allowed_users.py" \
+       "${SCRIPT_DIR}/backup_util.py" \
        "${SCRIPT_DIR}/command_runner.py" \
        "${SCRIPT_DIR}/config_store.py" \
        "${SCRIPT_DIR}/servers_store.py" \
