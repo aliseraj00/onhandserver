@@ -11,7 +11,7 @@ RECONFIGURE=false
 
 usage() {
     cat <<EOF
-Usage: sudo ./install.sh [options]
+Usage: sudo bash install.sh [options]
 
 Interactive installer — copies files, creates .env, installs deps, and starts the service.
 
@@ -28,9 +28,12 @@ Options:
   --systemd        Install and enable systemd service (default)
   -h, --help       Show this help
 
-After git pull (recommended):
-  sudo ./install.sh
-  sudo ./install.sh --upgrade
+Easiest upgrade (pull + install, no chmod/stash):
+  sudo ./update.sh
+
+Or manually:
+  git pull
+  sudo bash install.sh --upgrade
 
 Non-interactive bot env vars:
   TELEGRAM_BOT_TOKEN, ADMIN_CHAT_IDS
@@ -573,6 +576,7 @@ fi
 if [[ "$UPGRADE_MODE" == true ]]; then
     echo ""
     echo "Upgrade complete — code updated, config unchanged, service restarted."
+    echo "Next time:  sudo ./update.sh"
 fi
 
 if [[ "$USE_SYSTEMD" == false || "$systemd_ok" == false ]]; then
