@@ -19,8 +19,14 @@ from telegram.ext import (
 )
 
 from allowed_users import AllowedUsersStore
+from command_runner import CommandResult, format_command_result, run_command
 from config_store import ConfigStore
-from remote_client import RemoteAgentError, fetch_remote_status, ping_agent
+from remote_client import (
+    RemoteAgentError,
+    fetch_remote_status,
+    ping_agent,
+    run_remote_command,
+)
 from servers_store import ServersStore
 from system_stats import (
     ResourceSnapshot,
@@ -47,6 +53,9 @@ servers = ServersStore(SERVERS_PATH)
 LOCAL_SERVER_ID = "__local__"
 MONITOR_LOCAL = os.getenv("MONITOR_LOCAL", "true").lower() in ("1", "true", "yes")
 LOCAL_SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
+EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "30"))
+EXEC_MAX_OUTPUT = int(os.getenv("EXEC_MAX_OUTPUT", "3500"))
+EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() in ("1", "true", "yes")
 
 CB = "ohs"
 
@@ -136,6 +145,158 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
     return await fetch_remote_status(url, entry["token"])
 
 
+async def _execute_on_server(server_id: str, command: str) -> CommandResult:
+    if server_id == LOCAL_SERVER_ID:
+        return await asyncio.to_thread(
+            run_command,
+            command,
+            timeout=EXEC_TIMEOUT_SECONDS,
+            max_output=EXEC_MAX_OUTPUT,
+        )
+    entry = servers.get(server_id)
+    if entry is None:
+        raise RemoteAgentError("Server not found")
+    url = entry.get("url", "").strip()
+    if not url:
+        raise RemoteAgentError(
+            f"{entry['name']} has no URL — remove it and re-add with the agent URL"
+        )
+    return await run_remote_command(
+        url,
+        entry["token"],
+        command,
+        timeout=EXEC_TIMEOUT_SECONDS,
+        max_output=EXEC_MAX_OUTPUT,
+    )
+
+
+def _exec_server_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if MONITOR_LOCAL:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    _local_display_name() + " (local)",
+                    callback_data=_cb("exec", "s", LOCAL_SERVER_ID),
+                )
+            ]
+        )
+    for entry in servers.ready_servers:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    entry["name"],
+                    callback_data=_cb("exec", "s", entry["id"]),
+                )
+            ]
+        )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_exec_picker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if not EXEC_ENABLED:
+        await _send_or_edit(
+            update,
+            "Run command is disabled on this bot.\n"
+            "Enable EXEC_ENABLED in .env and run install.sh --upgrade.",
+            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+        )
+        return
+    targets = _monitor_target_ids()
+    if not targets:
+        await _send_or_edit(
+            update,
+            "No servers available to run commands on.",
+            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+        )
+        return
+    if len(targets) == 1:
+        await _prompt_exec_command(update, context, targets[0])
+        return
+    await _send_or_edit(
+        update,
+        "Run command\n\nPick the server to run on:",
+        reply_markup=_exec_server_keyboard(),
+    )
+
+
+async def _prompt_exec_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE | None,
+    server_id: str,
+) -> None:
+    if context is not None:
+        _set_awaiting(context, "exec", server_id=server_id)
+    label = _server_label(server_id)
+    await _send_or_edit(
+        update,
+        f"Run command on {label}\n\n"
+        "Send a shell command.\n"
+        "Examples:\n"
+        "  df -h\n"
+        "  systemctl status nginx\n"
+        "  docker ps",
+        reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+    )
+
+
+async def _run_exec_for_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    server_id: str,
+    command: str,
+) -> None:
+    if not _is_admin(update):
+        _clear_awaiting(context)
+        return
+    label = _server_label(server_id)
+    chat_id = _chat_id(update)
+    logger.info("Admin exec on %s (chat %s): %s", label, chat_id, command)
+    try:
+        result = await _execute_on_server(server_id, command)
+    except RemoteAgentError as exc:
+        await _send_or_edit(
+            update,
+            f"Could not run command on {label}: {exc}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⌨️ Try again",
+                            callback_data=_cb("exec", "s", server_id),
+                        )
+                    ],
+                    [_back_button()],
+                ]
+            ),
+        )
+        return
+
+    text = format_command_result(label=label, command=command, result=result)
+    await _send_or_edit(
+        update,
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⌨️ Run another",
+                        callback_data=_cb("exec", "s", server_id),
+                    )
+                ],
+                [_back_button()],
+            ]
+        ),
+        prefer_new=True,
+    )
+
+
 def _cb(*parts: str) -> str:
     return ":".join((CB, *parts))
 
@@ -164,6 +325,10 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))],
     ]
     if _is_admin(update):
+        if EXEC_ENABLED:
+            rows.append(
+                [InlineKeyboardButton("⌨️ Run command", callback_data=_cb("exec"))]
+            )
         rows.append(
             [
                 InlineKeyboardButton("👤 Users", callback_data=_cb("admin", "users")),
@@ -509,7 +674,9 @@ def _admin_users_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _status_actions_keyboard(server_id: str | None) -> InlineKeyboardMarkup:
+def _status_actions_keyboard(
+    server_id: str | None, update: Update | None = None
+) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🔄 Refresh", callback_data=_cb("status", "refresh"))],
         [
@@ -517,6 +684,16 @@ def _status_actions_keyboard(server_id: str | None) -> InlineKeyboardMarkup:
             _back_button(),
         ],
     ]
+    if server_id and update and _is_admin(update) and EXEC_ENABLED:
+        rows.insert(
+            1,
+            [
+                InlineKeyboardButton(
+                    "⌨️ Run command",
+                    callback_data=_cb("exec", "s", server_id),
+                )
+            ],
+        )
     if server_id:
         rows[0].insert(
             0,
@@ -635,7 +812,7 @@ async def _show_status(update: Update, server_id: str | None = None) -> None:
     await _send_or_edit(
         update,
         text,
-        reply_markup=_status_actions_keyboard(server_id),
+        reply_markup=_status_actions_keyboard(server_id, update),
         prefer_new=True,
     )
 
@@ -1155,6 +1332,22 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _show_admin_servers(update)
         return
 
+    if action == "exec":
+        if not _is_admin(update):
+            _clear_awaiting(context)
+            return
+        server_id = extra.get("server_id")
+        if not server_id:
+            _clear_awaiting(context)
+            await update.message.reply_text("No server selected.")
+            return
+        if not text:
+            await update.message.reply_text("Send a non-empty command.")
+            return
+        _clear_awaiting(context)
+        await _run_exec_for_admin(update, context, server_id, text)
+        return
+
     if action == "rename":
         if not _is_admin(update):
             _clear_awaiting(context)
@@ -1352,6 +1545,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action == "settings":
         await _show_settings(update)
+        return
+
+    if action == "exec":
+        if not _is_admin(update):
+            await query.answer("Admin only", show_alert=True)
+            return
+        if len(parts) > 2 and parts[1] == "s":
+            await _prompt_exec_command(update, context, parts[2])
+        else:
+            _clear_awaiting(context)
+            await _show_exec_picker(update, context)
         return
 
     if action == "al":

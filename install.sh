@@ -34,11 +34,11 @@ After git pull (recommended):
 
 Non-interactive bot env vars:
   TELEGRAM_BOT_TOKEN, ADMIN_CHAT_IDS
-  Optional: SERVER_NAME, MONITOR_LOCAL, DISK_PATH
+  Optional: SERVER_NAME, MONITOR_LOCAL, DISK_PATH, EXEC_ENABLED
 
 Non-interactive agent env vars:
   AGENT_TOKEN (auto-generated if unset)
-  Optional: DISK_PATH, AGENT_HOST, AGENT_PORT
+  Optional: DISK_PATH, AGENT_HOST, AGENT_PORT, EXEC_ENABLED
 EOF
 }
 
@@ -122,6 +122,57 @@ prompt_yes_no() {
     [[ "$input" =~ ^[Yy] ]]
 }
 
+env_bool_default() {
+    local value="${1:-false}"
+    if [[ "$value" == "true" || "$value" == "1" || "$value" == "yes" ]]; then
+        echo "y"
+    else
+        echo "n"
+    fi
+}
+
+prompt_exec_enabled() {
+    local role="${1:-server}"
+    local default
+    default="$(env_bool_default "${EXEC_ENABLED:-false}")"
+    echo ""
+    echo "Shell command execution lets admins run commands on this ${role} from Telegram."
+    if prompt_yes_no "Enable shell command execution?" "$default"; then
+        EXEC_ENABLED="true"
+    else
+        EXEC_ENABLED="false"
+    fi
+}
+
+set_env_var() {
+    local key="$1"
+    local value="$2"
+    local env_file="${INSTALL_DIR}/.env"
+    if grep -qE "^${key}=" "$env_file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+    else
+        echo "${key}=${value}" >> "$env_file"
+    fi
+}
+
+configure_exec_enabled_upgrade() {
+    local role="server"
+    [[ "$INSTALL_MODE" == "bot" ]] && role="bot server"
+    [[ "$INSTALL_MODE" == "agent" ]] && role="agent host"
+
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        if [[ -n "${EXEC_ENABLED:-}" ]]; then
+            set_env_var EXEC_ENABLED "$EXEC_ENABLED"
+            echo "Set EXEC_ENABLED=${EXEC_ENABLED}"
+        fi
+        return 0
+    fi
+
+    prompt_exec_enabled "$role"
+    set_env_var EXEC_ENABLED "$EXEC_ENABLED"
+    echo "Set EXEC_ENABLED=${EXEC_ENABLED}"
+}
+
 generate_token() {
     python3 -c "import secrets; print(secrets.token_urlsafe(24))"
 }
@@ -188,6 +239,7 @@ copy_files() {
     cp "${SCRIPT_DIR}/bot.py" \
        "${SCRIPT_DIR}/agent.py" \
        "${SCRIPT_DIR}/allowed_users.py" \
+       "${SCRIPT_DIR}/command_runner.py" \
        "${SCRIPT_DIR}/config_store.py" \
        "${SCRIPT_DIR}/servers_store.py" \
        "${SCRIPT_DIR}/remote_client.py" \
@@ -225,6 +277,7 @@ ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
 DISK_PATH=${DISK_PATH:-/}
 SERVER_NAME=${SERVER_NAME:-}
 MONITOR_LOCAL=${MONITOR_LOCAL:-true}
+EXEC_ENABLED=${EXEC_ENABLED:-false}
 EOF
     chmod 600 "${env_file}"
     echo "Wrote ${env_file}"
@@ -238,6 +291,7 @@ AGENT_TOKEN=${AGENT_TOKEN}
 DISK_PATH=${DISK_PATH:-/}
 AGENT_HOST=${AGENT_HOST:-0.0.0.0}
 AGENT_PORT=${AGENT_PORT:-8765}
+EXEC_ENABLED=${EXEC_ENABLED:-false}
 EOF
     chmod 600 "${env_file}"
     echo "Wrote ${env_file}"
@@ -312,6 +366,7 @@ run_bot_config_questions() {
     prompt DISK_PATH "Disk path to monitor" "/"
     DISK_PATH="${DISK_PATH:-/}"
     SERVER_NAME="${SERVER_NAME:-}"
+    prompt_exec_enabled "bot server"
 }
 
 run_agent_config_questions() {
@@ -336,6 +391,7 @@ run_agent_config_questions() {
     AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
     prompt AGENT_PORT "Listen port" "8765"
     AGENT_PORT="${AGENT_PORT:-8765}"
+    prompt_exec_enabled "agent host"
 }
 
 run_interactive_setup() {
@@ -445,11 +501,13 @@ run_noninteractive_setup() {
         SERVER_NAME="${SERVER_NAME:-}"
         MONITOR_LOCAL="${MONITOR_LOCAL:-true}"
         DISK_PATH="${DISK_PATH:-/}"
+        EXEC_ENABLED="${EXEC_ENABLED:-false}"
     else
         AGENT_TOKEN="${AGENT_TOKEN:-$(generate_token)}"
         DISK_PATH="${DISK_PATH:-/}"
         AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
         AGENT_PORT="${AGENT_PORT:-8765}"
+        EXEC_ENABLED="${EXEC_ENABLED:-false}"
     fi
 }
 
@@ -475,6 +533,7 @@ should_write_env=false
 if [[ "$UPGRADE_MODE" == true ]]; then
     echo "Keeping existing .env"
     load_existing_env || true
+    configure_exec_enabled_upgrade
 elif [[ "$RECONFIGURE" == true || "$NON_INTERACTIVE" == true ]]; then
     should_write_env=true
 elif [[ ! -f "${INSTALL_DIR}/.env" ]]; then

@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from command_runner import run_command
 from system_stats import sample_resources, snapshot_to_dict
 
 load_dotenv()
@@ -20,6 +21,9 @@ AGENT_TOKEN = os.getenv("AGENT_TOKEN", "")
 DISK_PATH = os.getenv("DISK_PATH", "/")
 AGENT_HOST = os.getenv("AGENT_HOST", "0.0.0.0")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8765"))
+EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "30"))
+EXEC_MAX_OUTPUT = int(os.getenv("EXEC_MAX_OUTPUT", "3500"))
+EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 class AgentHandler(BaseHTTPRequestHandler):
@@ -45,6 +49,16 @@ class AgentHandler(BaseHTTPRequestHandler):
     def _reject_unauthorized(self) -> None:
         self._send_json(401, {"error": "unauthorized"})
 
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
@@ -67,6 +81,45 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path != "/exec":
+            self._send_json(404, {"error": "not found"})
+            return
+        if not EXEC_ENABLED:
+            self._send_json(403, {"error": "command execution disabled"})
+            return
+        if not self._authorized():
+            self._reject_unauthorized()
+            return
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+
+        command = str(payload.get("command", "")).strip()
+        if not command:
+            self._send_json(400, {"error": "missing command"})
+            return
+
+        timeout = float(payload.get("timeout", EXEC_TIMEOUT_SECONDS))
+        max_output = int(payload.get("max_output", EXEC_MAX_OUTPUT))
+        try:
+            result = run_command(command, timeout=timeout, max_output=max_output)
+            self._send_json(
+                200,
+                {
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Failed to run command")
+            self._send_json(500, {"error": str(exc)})
 
 
 def main() -> None:
