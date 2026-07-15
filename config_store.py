@@ -17,12 +17,20 @@ SERVER_ALERT_DEFAULT: dict[str, Any] = {
     "disk_threshold_percent": 90,
 }
 
+BACKUP_DEFAULT: dict[str, Any] = {
+    "enabled": False,
+    "path": "",
+    "interval_minutes": 60,
+    "notify_chat_id": None,
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "check_interval_seconds": 30,
     "alert_cooldown_seconds": 300,
     "disk_path": _DEFAULT_DISK_PATH,
     "alert_show_top_processes": True,
     "server_alerts": {},
+    "backup": deepcopy(BACKUP_DEFAULT),
 }
 
 _LEGACY_ALERT_KEYS = (
@@ -81,12 +89,26 @@ class ConfigStore:
             return
         with self.path.open(encoding="utf-8") as handle:
             stored = json.load(handle)
+        had_legacy = "server_alerts" not in stored and any(
+            key in stored for key in _LEGACY_ALERT_KEYS
+        )
         stored = self._migrate_legacy(stored)
         merged = deepcopy(DEFAULT_CONFIG)
-        merged.update({k: v for k, v in stored.items() if k != "server_alerts"})
+        merged.update(
+            {
+                k: v
+                for k, v in stored.items()
+                if k not in ("server_alerts", "backup")
+            }
+        )
         merged["server_alerts"] = stored.get("server_alerts", {})
+        backup = deepcopy(BACKUP_DEFAULT)
+        backup.update(stored.get("backup") or {})
+        merged["backup"] = backup
         self._data = merged
         self._normalize_server_alerts()
+        if had_legacy:
+            self.save()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,4 +144,16 @@ class ConfigStore:
 
     def update_global(self, **changes: Any) -> None:
         self._data.update(changes)
+        self.save()
+
+    def get_backup(self) -> dict[str, Any]:
+        merged = deepcopy(BACKUP_DEFAULT)
+        stored = self._data.get("backup") or {}
+        merged.update(stored)
+        return merged
+
+    def update_backup(self, **changes: Any) -> None:
+        current = self.get_backup()
+        current.update(changes)
+        self._data["backup"] = current
         self.save()

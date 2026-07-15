@@ -1,10 +1,18 @@
 {
-  "alerts_enabled": true,
   "check_interval_seconds": 30,
   "alert_cooldown_seconds": 300,
-  "cpu_threshold_percent": 90,
-  "cpu_sustained_checks": 3,
-  "ram_threshold_percent": 90,
-  "disk_threshold_percent": 90,
-  "disk_path": "/"
+  "disk_path": "/",
+  "alert_show_top_processes": true,
+  "server_alerts": {
+    "__default__": {
+      "enabled": true,
+      "cpu_enabled": true,
+      "cpu_threshold_percent": 90,
+      "cpu_sustained_checks": 3,
+      "ram_enabled": true,
+      "ram_threshold_percent": 90,
+      "disk_enabled": true,
+      "disk_threshold_percent": 90
+    }
+  }
 }

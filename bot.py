@@ -3,11 +3,12 @@ import logging
 import os
 import socket
 import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -19,6 +20,14 @@ from telegram.ext import (
 )
 
 from allowed_users import AllowedUsersStore
+from backup_util import (
+    TELEGRAM_UPLOAD_LIMIT_BYTES,
+    BackupError,
+    create_backup_zip,
+    create_linux_logs_zip,
+    format_size,
+    list_important_linux_logs,
+)
 from command_runner import CommandResult, format_command_result, run_command
 from config_store import ConfigStore
 from remote_client import (
@@ -74,6 +83,8 @@ ADMIN_CHAT_IDS = _parse_chat_ids("ADMIN_CHAT_IDS") or _parse_chat_ids(
 
 _cpu_high_streak: dict[str, int] = {}
 _last_alert_at: dict[str, float] = {}
+_last_backup_at: float = 0.0
+_backup_running: bool = False
 
 
 def _allowed_chat_ids() -> set[int]:
@@ -307,6 +318,10 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🆔 My ID", callback_data=_cb("id"))],
     ]
     if _is_admin(update):
+        rows.insert(
+            2,
+            [InlineKeyboardButton("📦 Backup path", callback_data=_cb("bk"))],
+        )
         rows.append(
             [
                 InlineKeyboardButton("👤 Users", callback_data=_cb("admin", "users")),
@@ -359,6 +374,14 @@ def _format_alert_picker_text() -> str:
         "🔔 = alerts on  🔕 = alerts off\n"
         "[C/R/D] = CPU / RAM / Disk enabled\n\n"
         "Each server can have different resources and thresholds."
+    )
+
+
+async def _show_alert_picker(update: Update) -> None:
+    await _send_or_edit(
+        update,
+        _format_alert_picker_text(),
+        reply_markup=_alert_server_picker_keyboard(),
     )
 
 
@@ -880,11 +903,7 @@ async def _show_settings(update: Update) -> None:
     if len(targets) == 1:
         await _show_server_alerts(update, targets[0])
         return
-    await _send_or_edit(
-        update,
-        _format_alert_picker_text(),
-        reply_markup=_alert_server_picker_keyboard(),
-    )
+    await _show_alert_picker(update)
 
 
 async def _show_server_alerts(update: Update, server_id: str) -> None:
@@ -905,6 +924,8 @@ async def _show_cpu_alerts(update: Update, server_id: str) -> None:
         f"Status: {_on_off(cfg['cpu_enabled'])}\n"
         f"Threshold: {cfg['cpu_threshold_percent']:.0f}%\n"
         f"Sustained checks: {cfg['cpu_sustained_checks']}\n\n"
+        "Triggers when average CPU stays at/above the threshold "
+        "for the chosen number of checks.\n"
         "Pick a preset or send a custom value."
     )
     await _send_or_edit(
@@ -944,6 +965,339 @@ async def _show_global_alerts(update: Update) -> None:
     )
 
 
+def _format_backup_text() -> str:
+    b = config.get_backup()
+    path = b.get("path") or "(not set)"
+    interval = int(b.get("interval_minutes") or 60)
+    limit_mb = TELEGRAM_UPLOAD_LIMIT_BYTES / (1024 * 1024)
+    last = ""
+    if _last_backup_at > 0:
+        last = datetime.fromtimestamp(_last_backup_at).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last = "never"
+    return (
+        "📦 Backup path\n\n"
+        "Zips a local path on this bot host and uploads it to Telegram.\n"
+        f"Upload limit: {limit_mb:.0f} MB (Telegram Bot API).\n\n"
+        f"Path: {path}\n"
+        f"Repeat every: {interval} minute(s)\n"
+        f"Schedule: {_on_off(bool(b.get('enabled')))}\n"
+        f"Last backup: {last}\n\n"
+        "Set a path, optional repeat interval, then Run now or enable the schedule."
+    )
+
+
+def _backup_keyboard() -> InlineKeyboardMarkup:
+    b = config.get_backup()
+    toggle = "⏹ Stop schedule" if b.get("enabled") else "▶️ Start schedule"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📁 Set path", callback_data=_cb("bk", "path")),
+                InlineKeyboardButton(
+                    "⏱ Interval (min)", callback_data=_cb("bk", "int")
+                ),
+            ],
+            [
+                InlineKeyboardButton("5 min", callback_data=_cb("bk", "i", "5")),
+                InlineKeyboardButton("30 min", callback_data=_cb("bk", "i", "30")),
+                InlineKeyboardButton("60 min", callback_data=_cb("bk", "i", "60")),
+                InlineKeyboardButton("120 min", callback_data=_cb("bk", "i", "120")),
+            ],
+            [
+                InlineKeyboardButton("📤 Run now", callback_data=_cb("bk", "run")),
+                InlineKeyboardButton(toggle, callback_data=_cb("bk", "tog")),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 Linux logs", callback_data=_cb("bk", "logs")
+                )
+            ],
+            [_back_button()],
+        ]
+    )
+
+
+def _format_linux_logs_text() -> str:
+    rows = list_important_linux_logs()
+    found = sum(1 for _p, status, _d in rows if status == "found")
+    denied = sum(1 for _p, status, _d in rows if status == "denied")
+    limit_mb = TELEGRAM_UPLOAD_LIMIT_BYTES / (1024 * 1024)
+    lines = [
+        "📋 Important Linux logs\n",
+        f"Found readable: {found}  |  no access: {denied}",
+        f"Zip upload limit: {limit_mb:.0f} MB\n",
+    ]
+    icons = {"found": "✅", "missing": "·", "denied": "🔒", "other": "⚠️"}
+    # Keep message under Telegram's 4096 char limit
+    for path, status, detail in rows:
+        icon = icons.get(status, "·")
+        if status == "found":
+            lines.append(f"{icon} {path} ({detail})")
+        elif status == "denied":
+            lines.append(f"{icon} {path}")
+        else:
+            lines.append(f"{icon} {path}")
+    lines.append(
+        "\nTap Upload to zip all readable files from this list and send to Telegram."
+    )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3970] + "\n…(list truncated)"
+    return text
+
+
+def _linux_logs_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📤 Upload found logs", callback_data=_cb("bk", "logs", "up")
+                )
+            ],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data=_cb("bk", "logs")),
+                InlineKeyboardButton("◀️ Back", callback_data=_cb("bk")),
+            ],
+        ]
+    )
+
+
+async def _show_linux_logs(update: Update) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    await _send_or_edit(
+        update,
+        _format_linux_logs_text(),
+        reply_markup=_linux_logs_keyboard(),
+    )
+
+
+async def _show_backup(update: Update) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    await _send_or_edit(
+        update,
+        _format_backup_text(),
+        reply_markup=_backup_keyboard(),
+    )
+
+
+async def _send_zip_document(
+    bot,
+    chat_id: int,
+    *,
+    zip_factory,
+    filename_stem: str,
+    caption: str | None = None,
+    bump_schedule: bool = False,
+) -> list[str]:
+    """Build a zip via *zip_factory* and upload it. Returns included paths if any."""
+    global _backup_running, _last_backup_at
+    if _backup_running:
+        raise BackupError("A backup is already running. Try again shortly.")
+    _backup_running = True
+    zip_path: Path | None = None
+    included: list[str] = []
+    try:
+        result = await asyncio.to_thread(zip_factory)
+        if isinstance(result, tuple):
+            zip_path, included = result
+        else:
+            zip_path = result
+        size = zip_path.stat().st_size
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{filename_stem}_{stamp}.zip"
+        size_line = f"Size: {format_size(size)}"
+        if caption:
+            text = f"{caption}\n{size_line}"
+        else:
+            text = f"📦 Backup\n{size_line}"
+        if included:
+            preview = ", ".join(Path(p).name for p in included[:8])
+            more = f" (+{len(included) - 8} more)" if len(included) > 8 else ""
+            text = f"{text}\nFiles: {len(included)} ({preview}{more})"
+        # Telegram caption max 1024
+        if len(text) > 1000:
+            text = text[:997] + "..."
+        with zip_path.open("rb") as handle:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(handle, filename=filename),
+                caption=text,
+            )
+        if bump_schedule:
+            _last_backup_at = time.time()
+        return included
+    finally:
+        _backup_running = False
+        if zip_path is not None:
+            zip_path.unlink(missing_ok=True)
+
+
+async def _send_backup_document(
+    bot,
+    chat_id: int,
+    source_path: str,
+    *,
+    caption: str | None = None,
+) -> None:
+    name = Path(source_path).expanduser().name or "backup"
+    await _send_zip_document(
+        bot,
+        chat_id,
+        zip_factory=lambda: create_backup_zip(source_path),
+        filename_stem=name,
+        caption=caption or f"📦 Backup of {source_path}",
+        bump_schedule=True,
+    )
+
+
+async def _handle_backup_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]
+) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+
+    if not parts:
+        _clear_awaiting(context)
+        await _show_backup(update)
+        return
+
+    action = parts[0]
+
+    if action == "path":
+        _set_awaiting(context, "backup_path")
+        await _send_or_edit(
+            update,
+            "Send the absolute path to back up (file or folder).\n"
+            f"Zip must stay under {TELEGRAM_UPLOAD_LIMIT_BYTES // (1024 * 1024)} MB.",
+            reply_markup=InlineKeyboardMarkup([[_back_button("bk")]]),
+        )
+        return
+
+    if action == "int":
+        _set_awaiting(context, "backup_interval")
+        await _send_or_edit(
+            update,
+            "Send repeat interval in minutes (minimum 1).\n"
+            "Example: 30",
+            reply_markup=InlineKeyboardMarkup([[_back_button("bk")]]),
+        )
+        return
+
+    if action == "i" and len(parts) > 1:
+        try:
+            minutes = int(parts[1])
+        except ValueError:
+            await _show_backup(update)
+            return
+        if minutes < 1:
+            minutes = 1
+        config.update_backup(interval_minutes=minutes)
+        await _show_backup(update)
+        return
+
+    if action == "tog":
+        b = config.get_backup()
+        if not b.get("enabled"):
+            if not (b.get("path") or "").strip():
+                query = update.callback_query
+                if query:
+                    await query.answer("Set a path first", show_alert=True)
+                return
+            chat_id = _chat_id(update)
+            config.update_backup(enabled=True, notify_chat_id=chat_id)
+        else:
+            config.update_backup(enabled=False)
+        await _show_backup(update)
+        return
+
+    if action == "run":
+        b = config.get_backup()
+        path = (b.get("path") or "").strip()
+        chat_id = _chat_id(update)
+        query = update.callback_query
+        if not path:
+            if query:
+                await query.answer("Set a path first", show_alert=True)
+            return
+        if chat_id is None:
+            return
+        if query:
+            await query.answer("Creating zip…")
+        await _send_or_edit(
+            update,
+            f"📦 Creating backup of:\n{path}\n\nPlease wait…",
+            reply_markup=_backup_keyboard(),
+        )
+        try:
+            await _send_backup_document(
+                context.application.bot,
+                chat_id,
+                path,
+            )
+            await _show_backup(update)
+        except BackupError as exc:
+            await _send_or_edit(
+                update,
+                f"❌ Backup failed:\n{exc}",
+                reply_markup=_backup_keyboard(),
+            )
+        except Exception as exc:
+            logger.exception("Backup upload failed")
+            await _send_or_edit(
+                update,
+                f"❌ Backup upload failed:\n{exc}",
+                reply_markup=_backup_keyboard(),
+            )
+        return
+
+    if action == "logs":
+        if len(parts) > 1 and parts[1] == "up":
+            chat_id = _chat_id(update)
+            query = update.callback_query
+            if chat_id is None:
+                return
+            if query:
+                await query.answer("Collecting logs…")
+            await _send_or_edit(
+                update,
+                "📋 Zipping important Linux logs…\nPlease wait…",
+                reply_markup=_linux_logs_keyboard(),
+            )
+            try:
+                await _send_zip_document(
+                    context.application.bot,
+                    chat_id,
+                    zip_factory=create_linux_logs_zip,
+                    filename_stem="linux_logs",
+                    caption="📋 Important Linux logs backup",
+                )
+                await _show_linux_logs(update)
+            except BackupError as exc:
+                await _send_or_edit(
+                    update,
+                    f"❌ Logs upload failed:\n{exc}",
+                    reply_markup=_linux_logs_keyboard(),
+                )
+            except Exception as exc:
+                logger.exception("Linux logs upload failed")
+                await _send_or_edit(
+                    update,
+                    f"❌ Logs upload failed:\n{exc}",
+                    reply_markup=_linux_logs_keyboard(),
+                )
+            return
+        await _show_linux_logs(update)
+        return
+
+    await _show_backup(update)
+
+
 async def _handle_alert_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]
 ) -> None:
@@ -952,7 +1306,10 @@ async def _handle_alert_callback(
         return
 
     if not parts:
-        await _show_settings(update)
+        # Always show the server list — used by the "◀️ Servers" button.
+        # Do not call _show_settings() here: with one server that shortcuts
+        # back to the same alert screen and looks broken.
+        await _show_alert_picker(update)
         return
 
     if parts[0] == "g":
@@ -960,7 +1317,7 @@ async def _handle_alert_callback(
         return
 
     if parts[0] != "s" or len(parts) < 2:
-        await _show_settings(update)
+        await _show_alert_picker(update)
         return
 
     server_id = parts[1]
@@ -1431,6 +1788,45 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _show_global_alerts(update)
         return
 
+    if action == "backup_path":
+        if not _is_admin(update):
+            _clear_awaiting(context)
+            return
+        candidate = Path(text).expanduser()
+        if not candidate.exists():
+            await update.message.reply_text(
+                f"Path not found: {text}\nSend an existing file or folder path."
+            )
+            return
+        if not (candidate.is_file() or candidate.is_dir()):
+            await update.message.reply_text("Path must be a file or directory.")
+            return
+        _clear_awaiting(context)
+        resolved = str(candidate.resolve())
+        chat_id = _chat_id(update)
+        config.update_backup(path=resolved, notify_chat_id=chat_id)
+        await update.message.reply_text(f"Backup path set to:\n{resolved}")
+        await _show_backup(update)
+        return
+
+    if action == "backup_interval":
+        if not _is_admin(update):
+            _clear_awaiting(context)
+            return
+        try:
+            minutes = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter minutes as a whole number.")
+            return
+        if minutes < 1:
+            await update.message.reply_text("Interval must be at least 1 minute.")
+            return
+        _clear_awaiting(context)
+        config.update_backup(interval_minutes=minutes)
+        await update.message.reply_text(f"Backup interval set to {minutes} minute(s).")
+        await _show_backup(update)
+        return
+
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1498,6 +1894,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action == "al":
         await _handle_alert_callback(update, context, parts[1:])
+        return
+
+    if action == "bk":
+        if not _is_admin(update):
+            await query.answer("Admin only", show_alert=True)
+            return
+        await _handle_backup_callback(update, context, parts[1:])
         return
 
     if action == "admin":
@@ -1595,11 +1998,9 @@ def _evaluate_alerts(
     if cfg["cpu_enabled"]:
         cpu_threshold = float(cfg["cpu_threshold_percent"])
         sustained = int(cfg["cpu_sustained_checks"])
-        all_cores_high = bool(snapshot.cpu_percent_per_core) and all(
-            core >= cpu_threshold for core in snapshot.cpu_percent_per_core
-        )
+        cpu_high = snapshot.cpu_percent_avg >= cpu_threshold
         streak = _cpu_high_streak.get(server_id, 0)
-        if all_cores_high:
+        if cpu_high:
             streak += 1
         else:
             streak = 0
@@ -1610,9 +2011,9 @@ def _evaluate_alerts(
             text = (
                 f"🚨 CPU alert on {label}\n"
                 f"Host: {snapshot.hostname}\n"
-                f"All cores >= {cpu_threshold:.0f}% for {sustained} checks.\n"
-                f"Cores: {cores}\n"
-                f"Average: {snapshot.cpu_percent_avg:.1f}%"
+                f"Average CPU {snapshot.cpu_percent_avg:.1f}% "
+                f">= {cpu_threshold:.0f}% for {sustained} checks.\n"
+                f"Cores: {cores}"
             )
             if show_top:
                 text += format_top_processes_block(snapshot, kind="cpu")
@@ -1652,13 +2053,19 @@ def _evaluate_alerts(
 
 
 async def monitor_loop(application: Application) -> None:
+    logger.info("Monitor loop running")
     while True:
         config.load()
         servers.load()
         interval = int(config.data["check_interval_seconds"])
         try:
+            targets = _monitor_target_ids()
+            if not targets:
+                logger.warning(
+                    "Monitor: no targets (enable MONITOR_LOCAL or add remote servers)"
+                )
             all_alerts: list[str] = []
-            for server_id in _monitor_target_ids():
+            for server_id in targets:
                 alert_cfg = config.get_server_alerts(server_id)
                 if not alert_cfg["enabled"]:
                     continue
@@ -1678,10 +2085,14 @@ async def monitor_loop(application: Application) -> None:
                     _evaluate_alerts(snapshot, server_id, label, alert_cfg)
                 )
             if all_alerts:
+                logger.info("Sending %s alert(s)", len(all_alerts))
                 menu = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("📊 Open menu", callback_data=_cb("menu"))]]
                 )
-                for chat_id in _allowed_chat_ids():
+                recipients = _allowed_chat_ids()
+                if not recipients:
+                    logger.warning("Monitor: alerts ready but no allowed chat IDs")
+                for chat_id in recipients:
                     for text in all_alerts:
                         try:
                             await application.bot.send_message(
@@ -1696,10 +2107,62 @@ async def monitor_loop(application: Application) -> None:
         await asyncio.sleep(interval)
 
 
+async def backup_loop(application: Application) -> None:
+    global _last_backup_at
+    logger.info("Backup loop running")
+    while True:
+        try:
+            config.load()
+            b = config.get_backup()
+            enabled = bool(b.get("enabled"))
+            path = (b.get("path") or "").strip()
+            interval_min = max(1, int(b.get("interval_minutes") or 60))
+            chat_id = b.get("notify_chat_id")
+            if enabled and path and chat_id is not None:
+                due = (time.time() - _last_backup_at) >= interval_min * 60
+                if due and not _backup_running:
+                    try:
+                        await _send_backup_document(
+                            application.bot,
+                            int(chat_id),
+                            path,
+                            caption=(
+                                f"📦 Scheduled backup of {path}\n"
+                                f"Interval: every {interval_min} min"
+                            ),
+                        )
+                    except BackupError as exc:
+                        logger.warning("Scheduled backup failed: %s", exc)
+                        try:
+                            await application.bot.send_message(
+                                chat_id=int(chat_id),
+                                text=f"❌ Scheduled backup failed:\n{exc}",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to notify chat %s about backup error",
+                                chat_id,
+                            )
+                    except Exception:
+                        logger.exception("Scheduled backup upload error")
+        except Exception:
+            logger.exception("Backup loop error")
+        await asyncio.sleep(15)
+
+
 async def post_init(application: Application) -> None:
     interval = int(config.data["check_interval_seconds"])
-    application.create_task(monitor_loop(application))
-    logger.info("Background monitoring started (every %ss).", interval)
+    # Prefer JobQueue when available; otherwise start after the app is running
+    # so create_task is tracked correctly by PTB.
+    async def _start_background() -> None:
+        while not application.running:
+            await asyncio.sleep(0.05)
+        application.create_task(monitor_loop(application), name="monitor_loop")
+        application.create_task(backup_loop(application), name="backup_loop")
+        logger.info("Background monitoring started (every %ss).", interval)
+        logger.info("Background backup scheduler started.")
+
+    asyncio.create_task(_start_background(), name="start_background")
 
 
 def main() -> None:
