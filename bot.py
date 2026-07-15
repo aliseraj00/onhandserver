@@ -94,7 +94,7 @@ def _monitor_target_ids() -> list[str]:
     targets: list[str] = []
     if MONITOR_LOCAL:
         targets.append(LOCAL_SERVER_ID)
-    targets.extend(server["id"] for server in servers.servers)
+    targets.extend(server["id"] for server in servers.ready_servers)
     return targets
 
 
@@ -108,10 +108,12 @@ def _server_label(server_id: str) -> str:
 def _resolve_selection(chat_id: int | None) -> str | None:
     if chat_id is not None:
         selected = servers.get_selection(chat_id)
-        if selected and (
-            selected == LOCAL_SERVER_ID or servers.get(selected) is not None
-        ):
-            return selected
+        if selected:
+            if selected == LOCAL_SERVER_ID:
+                return selected
+            entry = servers.get(selected)
+            if entry and ServersStore.is_ready(entry):
+                return selected
     targets = _monitor_target_ids()
     if len(targets) == 1:
         return targets[0]
@@ -126,7 +128,12 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
     entry = servers.get(server_id)
     if entry is None:
         raise RemoteAgentError("Server not found")
-    return await fetch_remote_status(entry["url"], entry["token"])
+    url = entry.get("url", "").strip()
+    if not url:
+        raise RemoteAgentError(
+            f"{entry['name']} has no URL — remove it in Admin → Manage servers and re-add"
+        )
+    return await fetch_remote_status(url, entry["token"])
 
 
 def _cb(*parts: str) -> str:
@@ -443,7 +450,7 @@ async def _servers_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    for entry in servers.servers:
+    for entry in servers.ready_servers:
         mark = "✓ " if selected == entry["id"] else ""
         online = await ping_agent(entry["url"], entry["token"])
         dot = "🟢" if online else "🔴"
@@ -679,7 +686,7 @@ async def _show_servers(update: Update) -> None:
     if MONITOR_LOCAL:
         marker = " ← selected" if selected == LOCAL_SERVER_ID else ""
         lines.append(f"  local — {_local_display_name()}{marker}")
-    for entry in servers.servers:
+    for entry in servers.ready_servers:
         marker = " ← selected" if selected == entry["id"] else ""
         online = await ping_agent(entry["url"], entry["token"])
         state = "online" if online else "offline"
@@ -1056,10 +1063,20 @@ async def _show_admin_servers(update: Update) -> None:
     lines = ["Manage remote servers\n"]
     if servers.servers:
         for entry in servers.servers:
-            lines.append(f"  • {entry['name']} — {entry['url']}")
+            if ServersStore.is_ready(entry):
+                lines.append(f"  • {entry['name']} — {entry['url']}")
+            else:
+                lines.append(
+                    f"  • {entry['name']} — (missing URL — remove and re-add)"
+                )
     else:
         lines.append("  (none)")
     lines.append("\nAdd: name | url | token (token optional)")
+    if any(not ServersStore.is_ready(s) for s in servers.servers):
+        lines.append(
+            "\n⚠ Some entries have no URL (from an older install). "
+            "Remove them and add again with the agent URL."
+        )
     await _send_or_edit(
         update, "\n".join(lines), reply_markup=_admin_servers_keyboard()
     )

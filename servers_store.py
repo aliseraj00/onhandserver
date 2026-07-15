@@ -1,9 +1,12 @@
 import json
+import logging
 import secrets
 import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ServersStore:
@@ -18,12 +21,29 @@ class ServersStore:
             return
         with self.path.open(encoding="utf-8") as handle:
             stored = json.load(handle)
+        servers = stored.get("servers", [])
+        invalid = [s for s in servers if not self.is_ready(s)]
+        if invalid:
+            names = ", ".join(s.get("name", s.get("id", "?")) for s in invalid)
+            logger.warning(
+                "Ignoring %d server(s) without URL (re-add with name | url | token): %s",
+                len(invalid),
+                names,
+            )
         self._data = {
-            "servers": stored.get("servers", []),
+            "servers": servers,
             "user_selection": {
                 str(k): v for k, v in stored.get("user_selection", {}).items()
             },
         }
+
+    @staticmethod
+    def is_ready(entry: dict[str, Any]) -> bool:
+        return bool(entry.get("url", "").strip() and entry.get("token", "").strip())
+
+    @property
+    def ready_servers(self) -> list[dict[str, Any]]:
+        return [deepcopy(s) for s in self._data["servers"] if self.is_ready(s)]
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,6 +70,8 @@ class ServersStore:
     def add(self, name: str, url: str, token: str) -> dict[str, Any]:
         normalized_url = url.rstrip("/")
         for server in self._data["servers"]:
+            if not self.is_ready(server):
+                continue
             if server["url"].rstrip("/") == normalized_url:
                 raise ValueError(f"Server URL already registered as {server['name']}")
             if server["name"].lower() == name.strip().lower():
