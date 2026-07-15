@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/onhandserver}"
+REPO_URL="${OHS_REPO_URL:-https://github.com/aliseraj00/onhandserver.git}"
+REPO_BRANCH="${OHS_BRANCH:-main}"
+SOURCE_DIR="${OHS_SOURCE_DIR:-/opt/onhandserver-src}"
 INSTALL_MODE=""
 USE_SYSTEMD=true
 NON_INTERACTIVE=false
@@ -18,6 +21,12 @@ Interactive installer — copies files, creates .env, installs deps, and starts 
 If already installed, detects bot vs agent, keeps .env and data files, updates code,
 and restarts systemd. Choose "Reconfigure" to set everything up again.
 
+Quick install (no git clone needed):
+  bash <(curl -Ls https://raw.githubusercontent.com/aliseraj00/onhandserver/main/install.sh)
+
+Quick update:
+  bash <(curl -Ls https://raw.githubusercontent.com/aliseraj00/onhandserver/main/update.sh)
+
 Options:
   --dir PATH       Install directory (default: /opt/onhandserver)
   --upgrade        Update existing install, keep all config (non-interactive)
@@ -28,7 +37,7 @@ Options:
   --systemd        Install and enable systemd service (default)
   -h, --help       Show this help
 
-Easiest upgrade (pull + install, no chmod/stash):
+Easiest upgrade (from a local clone):
   sudo ./update.sh
 
 Or manually:
@@ -44,6 +53,56 @@ Non-interactive agent env vars:
   Optional: DISK_PATH, AGENT_HOST, AGENT_PORT, EXEC_ENABLED
 EOF
 }
+
+has_local_source() {
+    [[ -f "${SCRIPT_DIR}/bot.py" && -f "${SCRIPT_DIR}/agent.py" && -f "${SCRIPT_DIR}/requirements.txt" ]]
+}
+
+ensure_git() {
+    if command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "git is required for quick install. Install it first, e.g.:" >&2
+    echo "  apt install -y git" >&2
+    exit 1
+}
+
+sync_source_repo() {
+    ensure_git
+    mkdir -p "$(dirname "${SOURCE_DIR}")"
+    if [[ -d "${SOURCE_DIR}/.git" ]]; then
+        echo "Updating source at ${SOURCE_DIR} ..."
+        git -C "${SOURCE_DIR}" fetch --depth 1 origin "${REPO_BRANCH}"
+        git -C "${SOURCE_DIR}" checkout -B "${REPO_BRANCH}" "FETCH_HEAD"
+        git -C "${SOURCE_DIR}" reset --hard "FETCH_HEAD"
+        git -C "${SOURCE_DIR}" clean -fd
+    else
+        echo "Cloning ${REPO_URL} (${REPO_BRANCH}) → ${SOURCE_DIR} ..."
+        rm -rf "${SOURCE_DIR}"
+        git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${SOURCE_DIR}"
+    fi
+}
+
+# When run via curl process-substitution, download the repo then re-exec.
+bootstrap_if_needed() {
+    if has_local_source; then
+        return 0
+    fi
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "Quick install needs root privilege." >&2
+        echo "  sudo -i" >&2
+        echo "  bash <(curl -Ls https://raw.githubusercontent.com/aliseraj00/onhandserver/main/install.sh)" >&2
+        exit 1
+    fi
+
+    echo "No local source next to installer — bootstrapping from GitHub..."
+    sync_source_repo
+    echo "Continuing with ${SOURCE_DIR}/install.sh ..."
+    exec bash "${SOURCE_DIR}/install.sh" "$@"
+}
+
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -89,6 +148,8 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+bootstrap_if_needed "${ORIG_ARGS[@]}"
 
 prompt() {
     local var_name="$1"
