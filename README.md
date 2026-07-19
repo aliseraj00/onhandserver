@@ -123,7 +123,12 @@ Alerts are sent to admin and allowed-user chats when a threshold is exceeded.
 Only if `EXEC_ENABLED=true` on the target (bot host and/or agent).
 
 1. **Servers** → pick a server → **Run command**
-2. Send the command text; stdout/stderr are returned in the chat.
+2. Send commands **one by one** (each chat message is one command). Output streams live.
+3. `cd` persists for the session (shown as 📂 path) until you leave.
+4. **Stop** sends Ctrl+C to a running command (or closes the session if idle). **Back** leaves the session.
+5. Default timeout is **300s** (`EXEC_TIMEOUT_SECONDS`).
+
+Interactive editors (`nano`, `vim`, `top`, …) are blocked — edit files with `cat`, `sed`, or a heredoc in one message instead.
 
 ## Upgrade
 
