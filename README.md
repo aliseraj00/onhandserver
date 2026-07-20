@@ -85,6 +85,7 @@ Open your bot in Telegram and send `/start` (or `/help`).
 | **Backup path** | Admin only — zip a local path or Linux logs and send to Telegram |
 | **Users** | Admin only — allow or remove users |
 | **Manage servers** | Admin only — add, rename, or remove remote agents |
+| **Update** | Admin only — update the bot server, then all agents |
 
 ### Add a remote server (admin)
 
@@ -131,6 +132,19 @@ Only if `EXEC_ENABLED=true` on the target (bot host and/or agent).
 Interactive editors (`nano`, `vim`, `top`, …) are blocked — edit files with `cat`, `sed`, or a heredoc in one message instead.
 
 ## Upgrade
+
+### From the bot (recommended)
+
+Admins: **Update** in the main menu. The bot checks GitHub for a newer commit than what's installed:
+
+- **Update available** — shows the new commit titles, then **Yes, update** / **No**.
+- **Up to date** — offers **Check again** (or **Force update anyway** if you want to reinstall/restart regardless).
+
+Confirming runs the same update script on the bot host first, then automatically triggers it on every registered agent that has `EXEC_ENABLED=true` (agents without it need a manual update — see below). Both the bot and each agent restart themselves once their update finishes.
+
+Version tracking needs a `VERSION` file written by `install.sh` — existing installs will show "unknown" until they upgrade once (from the bot or the shell).
+
+### From the shell
 
 Quick update (no local clone needed):
 

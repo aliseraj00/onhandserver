@@ -318,6 +318,23 @@ copy_files() {
     else
         echo "  Kept existing monitor_config.json"
     fi
+
+    write_version_file
+}
+
+# Records which commit is installed so the bot's in-chat "Update" check can
+# tell whether GitHub has something newer.
+write_version_file() {
+    local sha=""
+    if command -v git >/dev/null 2>&1 && git -C "${SCRIPT_DIR}" rev-parse HEAD >/dev/null 2>&1; then
+        sha="$(git -C "${SCRIPT_DIR}" rev-parse HEAD)"
+    fi
+    if [[ -n "$sha" ]]; then
+        echo "$sha" > "${INSTALL_DIR}/VERSION"
+        echo "  Recorded installed commit: ${sha:0:7}"
+    else
+        echo "  Could not determine installed commit (not a git checkout) — VERSION not written"
+    fi
 }
 
 setup_venv() {

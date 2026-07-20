@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import psutil
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -77,6 +78,14 @@ EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "300"))
 EXEC_MAX_OUTPUT = int(os.getenv("EXEC_MAX_OUTPUT", "3500"))
 EXEC_LIVE_UPDATE_SECONDS = float(os.getenv("EXEC_LIVE_UPDATE_SECONDS", "1.5"))
 EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() in ("1", "true", "yes")
+UPDATE_SCRIPT_URL = os.getenv(
+    "OHS_UPDATE_SCRIPT_URL",
+    "https://raw.githubusercontent.com/aliseraj00/onhandserver/main/update.sh",
+)
+GITHUB_REPO = os.getenv("OHS_GITHUB_REPO", "aliseraj00/onhandserver")
+GITHUB_BRANCH = os.getenv("OHS_BRANCH", "main")
+GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
+VERSION_PATH = Path(__file__).resolve().parent / "VERSION"
 
 CB = "ohs"
 
@@ -98,6 +107,117 @@ _last_alert_at: dict[str, float] = {}
 _last_backup_at: float = 0.0
 _backup_running: bool = False
 _active_execs: dict[int, "ActiveExec"] = {}
+_last_update_triggered_at: float = 0.0
+_update_running: bool = False
+
+
+def _build_update_trigger_command() -> str:
+    """Shell command that starts the OnHandServer updater detached from the
+    caller's process/cgroup, so it keeps running even after this process
+    (bot or agent) restarts as part of the update.
+
+    Prefers `systemd-run` (new transient unit/cgroup — required so the job
+    survives `systemctl restart` on the service that launched it). Falls
+    back to a plain backgrounded process for non-systemd installs.
+    """
+    update_cmd = f'bash -c "$(curl -Ls {UPDATE_SCRIPT_URL})"'
+    log_path = "/tmp/ohs-update.log"
+    inner = f"{update_cmd} >>{log_path} 2>&1"
+    return (
+        "if command -v systemd-run >/dev/null 2>&1; then "
+        f'systemd-run --collect --no-block --unit="ohs-update-$(date +%s)" '
+        f"/bin/bash -c '{inner}'; "
+        "else "
+        f"nohup /bin/bash -c '{inner}' >/dev/null 2>&1 & "
+        "fi"
+    )
+
+
+def _read_local_commit() -> str | None:
+    """Commit hash installed on this host, written to VERSION by install.sh."""
+    try:
+        text = VERSION_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    first_line = text.splitlines()[0].strip() if text else ""
+    return first_line or None
+
+
+def _short_sha(sha: str | None) -> str:
+    return sha[:7] if sha else "unknown"
+
+
+async def _fetch_latest_commit() -> dict:
+    """Latest commit on GITHUB_BRANCH: {'sha': str, 'title': str}."""
+    url = f"{GITHUB_API_BASE}/commits/{GITHUB_BRANCH}"
+    async with httpx.AsyncClient(
+        timeout=10.0, headers={"Accept": "application/vnd.github+json"}
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        data = response.json()
+    message = str(data.get("commit", {}).get("message", "")).strip()
+    title = message.splitlines()[0] if message else "(no commit message)"
+    return {"sha": str(data["sha"]), "title": title}
+
+
+async def _fetch_commit_titles_between(
+    base_sha: str, head_sha: str, *, limit: int = 12
+) -> list[str]:
+    """Titles of commits after base_sha up to head_sha, newest first."""
+    url = f"{GITHUB_API_BASE}/compare/{base_sha}...{head_sha}"
+    async with httpx.AsyncClient(
+        timeout=10.0, headers={"Accept": "application/vnd.github+json"}
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        data = response.json()
+    titles: list[str] = []
+    for entry in data.get("commits", []):
+        message = str(entry.get("commit", {}).get("message", "")).strip()
+        titles.append(message.splitlines()[0] if message else "(no commit message)")
+    titles.reverse()
+    return titles[:limit]
+
+
+async def _check_for_update() -> dict:
+    """Compare the installed commit against the latest on GitHub.
+
+    Returns a dict with: ok, error, current_sha, latest_sha, latest_title,
+    commit_titles (list[str], newest first), update_available (bool).
+    """
+    result: dict = {
+        "ok": False,
+        "error": None,
+        "current_sha": _read_local_commit(),
+        "latest_sha": None,
+        "latest_title": None,
+        "commit_titles": [],
+        "update_available": False,
+    }
+    try:
+        latest = await _fetch_latest_commit()
+    except Exception as exc:  # network error, bad response, rate limit, etc.
+        result["error"] = str(exc)
+        return result
+
+    result["ok"] = True
+    result["latest_sha"] = latest["sha"]
+    result["latest_title"] = latest["title"]
+
+    current_sha = result["current_sha"]
+    if current_sha and current_sha == latest["sha"]:
+        return result
+
+    result["update_available"] = True
+    if current_sha:
+        try:
+            result["commit_titles"] = await _fetch_commit_titles_between(
+                current_sha, latest["sha"]
+            )
+        except Exception:
+            result["commit_titles"] = []
+    return result
 
 
 class ActiveExec:
@@ -604,6 +724,9 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
                     "🖥 Manage servers", callback_data=_cb("admin", "servers")
                 ),
             ]
+        )
+        rows.append(
+            [InlineKeyboardButton("🔄 Update", callback_data=_cb("upd"))]
         )
     return InlineKeyboardMarkup(rows)
 
@@ -1966,6 +2089,205 @@ async def _show_admin_servers(update: Update) -> None:
     )
 
 
+def _format_update_check_text(check: dict) -> str:
+    agents = servers.ready_servers
+    lines = ["🔄 Software update", ""]
+
+    if check.get("error"):
+        lines.append(f"⚠️ Could not check GitHub for updates:\n{check['error']}")
+    elif check.get("update_available"):
+        current_sha = check.get("current_sha")
+        lines.append(
+            f"🟢 Update available: {_short_sha(current_sha)} → "
+            f"{_short_sha(check.get('latest_sha'))}"
+        )
+        titles = check.get("commit_titles") or []
+        if titles:
+            lines.append("")
+            lines.append("New commits:")
+            for title in titles:
+                lines.append(f"  • {title}")
+        elif check.get("latest_title"):
+            lines.append("")
+            lines.append(f"Latest commit: {check['latest_title']}")
+        if not current_sha:
+            lines.append("")
+            lines.append(
+                "(Current version unknown on this host — upgrade once to "
+                "enable precise change tracking.)"
+            )
+        lines.append("")
+        lines.append("Update the bot server first, then all agents?")
+    else:
+        lines.append(f"✅ Up to date (commit {_short_sha(check.get('current_sha'))}).")
+
+    lines.append("")
+    lines.append(f"Remote agents: {len(agents)}")
+    if agents:
+        for entry in agents:
+            lines.append(f"  • {entry['name']}")
+        lines.append("")
+        lines.append(
+            "Agents update after the bot server finishes. Each agent needs "
+            "'Run command' (EXEC_ENABLED) turned on to receive the update "
+            "automatically — otherwise update it manually on that host."
+        )
+
+    if _last_update_triggered_at > 0:
+        last = datetime.fromtimestamp(_last_update_triggered_at).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        lines.append(f"\nLast triggered: {last}")
+
+    return "\n".join(lines)
+
+
+def _update_check_keyboard(check: dict) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if check.get("error"):
+        rows.append([InlineKeyboardButton("🔄 Retry check", callback_data=_cb("upd"))])
+        rows.append(
+            [InlineKeyboardButton("⚠️ Update anyway", callback_data=_cb("upd", "go"))]
+        )
+    elif check.get("update_available"):
+        rows.append(
+            [
+                InlineKeyboardButton("✅ Yes, update", callback_data=_cb("upd", "go")),
+                InlineKeyboardButton("❌ No", callback_data=_cb("menu")),
+            ]
+        )
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=_cb("upd"))])
+    else:
+        rows.append([InlineKeyboardButton("🔄 Check again", callback_data=_cb("upd"))])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⚠️ Force update anyway", callback_data=_cb("upd", "go")
+                )
+            ]
+        )
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _update_progress_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Check again", callback_data=_cb("upd"))],
+            [_back_button()],
+        ]
+    )
+
+
+async def _show_update(update: Update) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    check = await _check_for_update()
+    await _send_or_edit(
+        update,
+        _format_update_check_text(check),
+        reply_markup=_update_check_keyboard(check),
+    )
+
+
+async def _run_update_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    global _update_running, _last_update_triggered_at
+
+    if not _is_admin(update):
+        await _deny(update)
+        return
+
+    query = update.callback_query
+    if _update_running:
+        if query:
+            await query.answer("An update is already in progress.", show_alert=True)
+        return
+
+    _update_running = True
+    try:
+        agents = servers.ready_servers
+        cmd = _build_update_trigger_command()
+
+        await _send_or_edit(
+            update,
+            "🔄 Updating bot server…\n"
+            "This can take a minute; the bot will restart automatically.",
+            reply_markup=_update_progress_keyboard(),
+        )
+
+        try:
+            local_result = await _execute_on_server(LOCAL_SERVER_ID, cmd)
+        except RemoteAgentError as exc:
+            await _send_or_edit(
+                update,
+                f"❌ Could not start the bot server update:\n{exc}",
+                reply_markup=_update_progress_keyboard(),
+                prefer_new=True,
+            )
+            return
+
+        if local_result.exit_code != 0:
+            detail = (local_result.stderr or local_result.stdout or "unknown error").strip()
+            await _send_or_edit(
+                update,
+                f"❌ Bot server update failed to start (exit {local_result.exit_code}):\n{detail}",
+                reply_markup=_update_progress_keyboard(),
+                prefer_new=True,
+            )
+            return
+
+        lines = ["✅ Bot server update started — it will restart shortly.", ""]
+        if not agents:
+            lines.append("No remote agents registered.")
+        else:
+            lines.append("Updating agents:")
+            for entry in agents:
+                try:
+                    result = await _execute_on_server(entry["id"], cmd)
+                except RemoteAgentError as exc:
+                    lines.append(f"  ❌ {entry['name']} — {exc}")
+                    continue
+                if result.exit_code == 0:
+                    lines.append(f"  ✅ {entry['name']} — started")
+                else:
+                    detail = (result.stderr or result.stdout or "").strip()
+                    lines.append(
+                        f"  ❌ {entry['name']} — exit {result.exit_code} {detail}"
+                    )
+
+        lines.append("")
+        lines.append(
+            "Give it a minute, then check Servers / Status to confirm everyone is back online."
+        )
+        _last_update_triggered_at = time.time()
+        await _send_or_edit(
+            update,
+            "\n".join(lines),
+            reply_markup=_update_progress_keyboard(),
+            prefer_new=True,
+        )
+    finally:
+        _update_running = False
+
+
+async def _handle_update_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]
+) -> None:
+    if not _is_admin(update):
+        await _deny(update)
+        return
+    if not parts:
+        await _show_update(update)
+        return
+    if parts[0] == "go":
+        await _run_update_flow(update, context)
+        return
+    await _show_update(update)
+
+
 def _set_awaiting(context: ContextTypes.DEFAULT_TYPE, action: str, **extra) -> None:
     context.user_data["awaiting"] = action
     context.user_data["awaiting_extra"] = extra
@@ -2313,6 +2635,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Admin only", show_alert=True)
             return
         await _handle_backup_callback(update, context, parts[1:])
+        return
+
+    if action == "upd":
+        if not _is_admin(update):
+            await query.answer("Admin only", show_alert=True)
+            return
+        await _handle_update_callback(update, context, parts[1:])
         return
 
     if action == "admin":
