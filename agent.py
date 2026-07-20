@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-from command_runner import run_command
+from command_runner import CommandCancel, run_command
 from system_stats import sample_resources, snapshot_to_dict
 
 load_dotenv()
@@ -21,13 +21,16 @@ AGENT_TOKEN = os.getenv("AGENT_TOKEN", "")
 DISK_PATH = os.getenv("DISK_PATH", "/")
 AGENT_HOST = os.getenv("AGENT_HOST", "0.0.0.0")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8765"))
-EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "30"))
+EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "300"))
 EXEC_MAX_OUTPUT = int(os.getenv("EXEC_MAX_OUTPUT", "3500"))
 EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 class AgentHandler(BaseHTTPRequestHandler):
     server_version = "OnHandServerAgent/1.0"
+    protocol_version = "HTTP/1.1"
+    # Long-running shell commands stream for up to EXEC_TIMEOUT_SECONDS.
+    timeout = max(EXEC_TIMEOUT_SECONDS + 30.0, 330.0)
 
     def log_message(self, format: str, *args) -> None:
         logger.info("%s - %s", self.address_string(), format % args)
@@ -43,8 +46,28 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _begin_ndjson_stream(self, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_ndjson(self, payload: dict) -> None:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _end_ndjson_stream(self) -> None:
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _reject_unauthorized(self) -> None:
         self._send_json(401, {"error": "unauthorized"})
@@ -106,20 +129,71 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         timeout = float(payload.get("timeout", EXEC_TIMEOUT_SECONDS))
         max_output = int(payload.get("max_output", EXEC_MAX_OUTPUT))
+        cwd_raw = payload.get("cwd")
+        cwd = str(cwd_raw).strip() if cwd_raw else None
+        cancel = CommandCancel()
+
+        self._begin_ndjson_stream()
+
+        def on_output(stream: str, text: str) -> None:
+            try:
+                self._write_ndjson({"event": "out", "stream": stream, "text": text})
+            except OSError:
+                # Client disconnected (Stop) — treat like Ctrl+C.
+                cancel.interrupt()
+                raise
+
         try:
-            result = run_command(command, timeout=timeout, max_output=max_output)
-            self._send_json(
-                200,
-                {
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "exit_code": result.exit_code,
-                    "timed_out": result.timed_out,
-                },
+            result = run_command(
+                command,
+                timeout=timeout,
+                max_output=max_output,
+                on_output=on_output,
+                cancel=cancel,
+                cwd=cwd,
             )
+            try:
+                self._write_ndjson(
+                    {
+                        "event": "done",
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                        "cancelled": result.cancelled,
+                        "cwd": result.cwd,
+                    }
+                )
+            except OSError:
+                cancel.interrupt()
+        except OSError:
+            cancel.interrupt()
+            try:
+                self._write_ndjson(
+                    {
+                        "event": "done",
+                        "stdout": "",
+                        "stderr": "Stopped (Ctrl+C)",
+                        "exit_code": 130,
+                        "timed_out": False,
+                        "cancelled": True,
+                        "cwd": cwd,
+                    }
+                )
+            except OSError:
+                pass
         except Exception as exc:
             logger.exception("Failed to run command")
-            self._send_json(500, {"error": str(exc)})
+            cancel.kill()
+            try:
+                self._write_ndjson({"event": "error", "error": str(exc)})
+            except OSError:
+                pass
+        finally:
+            try:
+                self._end_ndjson_stream()
+            except OSError:
+                pass
 
 
 def main() -> None:

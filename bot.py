@@ -30,10 +30,19 @@ from backup_util import (
     format_size,
     list_important_linux_logs,
 )
-from command_runner import CommandResult, format_command_result, run_command
+from command_runner import (
+    CommandCancel,
+    CommandResult,
+    default_cwd,
+    format_command_progress,
+    format_command_result,
+    interactive_command_block_reason,
+    run_command,
+)
 from config_store import ConfigStore
 from remote_client import (
     RemoteAgentError,
+    RemoteExecHandle,
     fetch_remote_status,
     ping_agent,
     run_remote_command,
@@ -64,8 +73,9 @@ servers = ServersStore(SERVERS_PATH)
 LOCAL_SERVER_ID = "__local__"
 MONITOR_LOCAL = os.getenv("MONITOR_LOCAL", "true").lower() in ("1", "true", "yes")
 LOCAL_SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
-EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "30"))
+EXEC_TIMEOUT_SECONDS = float(os.getenv("EXEC_TIMEOUT_SECONDS", "300"))
 EXEC_MAX_OUTPUT = int(os.getenv("EXEC_MAX_OUTPUT", "3500"))
+EXEC_LIVE_UPDATE_SECONDS = float(os.getenv("EXEC_LIVE_UPDATE_SECONDS", "1.5"))
 EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() in ("1", "true", "yes")
 
 CB = "ohs"
@@ -87,6 +97,20 @@ _cpu_high_streak: dict[str, int] = {}
 _last_alert_at: dict[str, float] = {}
 _last_backup_at: float = 0.0
 _backup_running: bool = False
+_active_execs: dict[int, "ActiveExec"] = {}
+
+
+class ActiveExec:
+    """Tracks a running shell command so Stop can send Ctrl+C."""
+
+    def __init__(self) -> None:
+        self.local_cancel = CommandCancel()
+        self.remote_handle: RemoteExecHandle | None = None
+
+    def interrupt(self) -> None:
+        self.local_cancel.interrupt()
+        if self.remote_handle is not None:
+            self.remote_handle.interrupt()
 
 
 def _allowed_chat_ids() -> set[int]:
@@ -158,14 +182,55 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
     return await fetch_remote_status(url, entry["token"])
 
 
-async def _execute_on_server(server_id: str, command: str) -> CommandResult:
+async def _execute_on_server(
+    server_id: str,
+    command: str,
+    *,
+    on_output=None,
+    active: ActiveExec | None = None,
+    cwd: str | None = None,
+) -> CommandResult:
     if server_id == LOCAL_SERVER_ID:
-        return await asyncio.to_thread(
-            run_command,
-            command,
-            timeout=EXEC_TIMEOUT_SECONDS,
-            max_output=EXEC_MAX_OUTPUT,
-        )
+        cancel = active.local_cancel if active is not None else None
+        if on_output is None:
+            return await asyncio.to_thread(
+                run_command,
+                command,
+                timeout=EXEC_TIMEOUT_SECONDS,
+                max_output=EXEC_MAX_OUTPUT,
+                cancel=cancel,
+                cwd=cwd,
+            )
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+
+        def _sync_on_output(stream: str, text: str) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, (stream, text))
+
+        async def _pump() -> None:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                stream, text = item
+                await on_output(stream, text)
+
+        pump_task = asyncio.create_task(_pump())
+        try:
+            result = await asyncio.to_thread(
+                run_command,
+                command,
+                timeout=EXEC_TIMEOUT_SECONDS,
+                max_output=EXEC_MAX_OUTPUT,
+                on_output=_sync_on_output,
+                cancel=cancel,
+                cwd=cwd,
+            )
+        finally:
+            queue.put_nowait(None)
+            await pump_task
+        return result
+
     entry = servers.get(server_id)
     if entry is None:
         raise RemoteAgentError("Server not found")
@@ -174,20 +239,53 @@ async def _execute_on_server(server_id: str, command: str) -> CommandResult:
         raise RemoteAgentError(
             f"{entry['name']} has no URL — remove it and re-add with the agent URL"
         )
+    remote_handle = RemoteExecHandle()
+    if active is not None:
+        active.remote_handle = remote_handle
     return await run_remote_command(
         url,
         entry["token"],
         command,
         timeout=EXEC_TIMEOUT_SECONDS,
         max_output=EXEC_MAX_OUTPUT,
+        on_output=on_output,
+        handle=remote_handle,
+        cwd=cwd,
     )
 
 
-def _exec_back_keyboard(server_id: str) -> InlineKeyboardMarkup:
+def _exec_session_keyboard(server_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("◀️ Back", callback_data=_cb("pick", server_id))]]
+        [
+            [
+                InlineKeyboardButton(
+                    "⏹ Stop",
+                    callback_data=_cb("exec", "stop", server_id),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "◀️ Back",
+                    callback_data=_cb("exec", "back", server_id),
+                )
+            ],
+        ]
     )
 
+
+def _leave_exec_session(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+    *,
+    interrupt: bool = True,
+) -> None:
+    if interrupt and chat_id is not None:
+        active = _active_execs.pop(chat_id, None)
+        if active is not None:
+            active.interrupt()
+    elif chat_id is not None:
+        _active_execs.pop(chat_id, None)
+    _clear_awaiting(context)
 
 async def _show_server_actions(update: Update, server_id: str) -> None:
     if not _authorized(update):
@@ -217,21 +315,44 @@ async def _prompt_exec_command(
             update,
             "Run command is disabled.\n"
             "Enable EXEC_ENABLED in .env and run install.sh --upgrade.",
-            reply_markup=_exec_back_keyboard(server_id),
+            reply_markup=_exec_session_keyboard(server_id),
         )
         return
+
+    cwd = default_cwd()
+    if server_id != LOCAL_SERVER_ID:
+        try:
+            pwd = await _execute_on_server(server_id, "pwd")
+            if pwd.exit_code == 0 and pwd.stdout.strip():
+                cwd = pwd.stdout.strip().splitlines()[-1].strip()
+            elif pwd.cwd:
+                cwd = pwd.cwd
+        except RemoteAgentError:
+            cwd = "/"
+
     if context is not None:
-        _set_awaiting(context, "exec", server_id=server_id)
+        _set_awaiting(context, "exec", server_id=server_id, cwd=cwd)
     label = _server_label(server_id)
     await _send_or_edit(
         update,
-        f"Run command on {label}\n\n"
-        "Send a shell command.\n"
+        f"Shell session on {label}\n"
+        f"📂 {cwd}\n\n"
+        "Send commands one by one — each message is one command.\n"
+        "cd persists for this session until you leave.\n"
+        "Paths with spaces are fine: cd Developer - AliAkbar\n"
+        f"Output streams live; timeout is {EXEC_TIMEOUT_SECONDS:.0f}s.\n\n"
+        "⏹ Stop = Ctrl+C (interrupt a running command), or leave the session if idle.\n"
+        "◀️ Back = leave the session.\n\n"
+        "Interactive editors (nano/vim/top/…) are not supported — "
+        "use cat, sed, or a heredoc to view/edit files.\n\n"
         "Examples:\n"
-        "  df -h\n"
-        "  systemctl status nginx\n"
-        "  docker ps",
-        reply_markup=_exec_back_keyboard(server_id),
+        "  pwd\n"
+        "  cd Developer - AliAkbar\n"
+        "  ls\n"
+        "  cat > /tmp/note.txt <<'EOF'\n"
+        "  hello\n"
+        "  EOF",
+        reply_markup=_exec_session_keyboard(server_id),
     )
 
 
@@ -242,53 +363,205 @@ async def _run_exec_for_admin(
     command: str,
 ) -> None:
     if not _is_admin(update):
-        _clear_awaiting(context)
-        return
-    label = _server_label(server_id)
-    chat_id = _chat_id(update)
-    logger.info("Admin exec on %s (chat %s): %s", label, chat_id, command)
-    try:
-        result = await _execute_on_server(server_id, command)
-    except RemoteAgentError as exc:
-        back_btn = InlineKeyboardButton(
-            "◀️ Back to server", callback_data=_cb("pick", server_id)
-        )
-        await _send_or_edit(
-            update,
-            f"Could not run command on {label}: {exc}",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "⌨️ Try again",
-                            callback_data=_cb("exec", "s", server_id),
-                        )
-                    ],
-                    [back_btn],
-                ]
-            ),
-        )
+        _leave_exec_session(context, _chat_id(update))
         return
 
-    text = format_command_result(label=label, command=command, result=result)
-    back_btn = InlineKeyboardButton(
-        "◀️ Back to server", callback_data=_cb("pick", server_id)
+    chat_id = _chat_id(update)
+    if chat_id is not None and chat_id in _active_execs:
+        if update.message:
+            await update.message.reply_text(
+                "A command is already running. Tap ⏹ Stop (Ctrl+C) first.",
+                reply_markup=_exec_session_keyboard(server_id),
+            )
+        return
+
+    extra = context.user_data.get("awaiting_extra", {}) or {}
+    cwd = str(extra.get("cwd") or default_cwd())
+
+    # Stay in the shell session for more commands.
+    _set_awaiting(context, "exec", server_id=server_id, cwd=cwd)
+
+    blocked = interactive_command_block_reason(command)
+    if blocked:
+        if update.message:
+            await update.message.reply_text(
+                blocked,
+                reply_markup=_exec_session_keyboard(server_id),
+            )
+        else:
+            await _send_or_edit(
+                update,
+                blocked,
+                reply_markup=_exec_session_keyboard(server_id),
+                prefer_new=True,
+            )
+        return
+
+    label = _server_label(server_id)
+    logger.info("Admin exec on %s (chat %s) cwd=%s: %s", label, chat_id, cwd, command)
+
+    session_markup = _exec_session_keyboard(server_id)
+    started = time.monotonic()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    last_edit_at = 0.0
+    last_text = ""
+    progress_message = None
+    bot = context.application.bot
+    active = ActiveExec()
+    if chat_id is not None:
+        _active_execs[chat_id] = active
+
+    async def _ensure_progress_message():
+        nonlocal progress_message
+        if progress_message is not None:
+            return progress_message
+        text = format_command_progress(
+            label=label,
+            command=command,
+            stdout="",
+            stderr="",
+            elapsed_s=0,
+            cwd=cwd,
+        )
+        if update.message:
+            progress_message = await update.message.reply_text(
+                text, reply_markup=session_markup
+            )
+        elif update.callback_query and update.callback_query.message:
+            progress_message = await update.callback_query.message.reply_text(
+                text, reply_markup=session_markup
+            )
+        else:
+            if chat_id is None:
+                raise RemoteAgentError("Missing chat for progress updates")
+            progress_message = await bot.send_message(
+                chat_id, text, reply_markup=session_markup
+            )
+        return progress_message
+
+    async def _edit_progress(*, force: bool = False) -> None:
+        nonlocal last_edit_at, last_text
+        msg = await _ensure_progress_message()
+        now = time.monotonic()
+        if not force and (now - last_edit_at) < EXEC_LIVE_UPDATE_SECONDS:
+            return
+        text = format_command_progress(
+            label=label,
+            command=command,
+            stdout="".join(stdout_parts),
+            stderr="".join(stderr_parts),
+            elapsed_s=now - started,
+            cwd=cwd,
+        )
+        if text == last_text and not force:
+            return
+        try:
+            await msg.edit_text(text, reply_markup=session_markup)
+            last_text = text
+            last_edit_at = now
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Could not edit exec progress: %s", exc)
+
+    async def on_output(stream: str, text: str) -> None:
+        if stream == "stderr":
+            stderr_parts.append(text)
+        else:
+            stdout_parts.append(text)
+        await _edit_progress()
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(EXEC_LIVE_UPDATE_SECONDS)
+            await _edit_progress(force=True)
+
+    await _ensure_progress_message()
+    heartbeat = asyncio.create_task(_heartbeat())
+    try:
+        try:
+            result = await _execute_on_server(
+                server_id,
+                command,
+                on_output=on_output,
+                active=active,
+                cwd=cwd,
+            )
+        except RemoteAgentError as exc:
+            err_text = f"Could not run command on {label}: {exc}"
+            if progress_message is not None:
+                try:
+                    await progress_message.edit_text(
+                        err_text, reply_markup=session_markup
+                    )
+                    return
+                except BadRequest:
+                    pass
+            await _send_or_edit(
+                update,
+                err_text,
+                reply_markup=session_markup,
+                prefer_new=True,
+            )
+            return
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+        if chat_id is not None:
+            current = _active_execs.get(chat_id)
+            if current is active:
+                _active_execs.pop(chat_id, None)
+
+    next_cwd = result.cwd or cwd
+    _set_awaiting(context, "exec", server_id=server_id, cwd=next_cwd)
+
+    text, parse_mode = format_command_result(
+        label=label, command=command, result=result, cwd=next_cwd
     )
+    if progress_message is not None:
+        try:
+            await progress_message.edit_text(
+                text, reply_markup=session_markup, parse_mode=parse_mode
+            )
+            return
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Could not finalize exec message: %s", exc)
+                # Fallback without parse_mode if HTML fails.
+                try:
+                    plain, _ = format_command_result(
+                        label=label,
+                        command=command,
+                        result=result,
+                        cwd=next_cwd,
+                    )
+                    # Re-format without code block by forcing non-cat display:
+                    if parse_mode:
+                        plain = (
+                            f"🖥 {label}\n"
+                            + (f"📂 {next_cwd}\n" if next_cwd else "")
+                            + f"$ {command}\n\n"
+                            + result.stdout.rstrip()
+                            + f"\n\nExit code: {result.exit_code}"
+                        )
+                        if len(plain) > 4096:
+                            plain = plain[:4050] + "\n... (message truncated)"
+                    await progress_message.edit_text(
+                        plain, reply_markup=session_markup
+                    )
+                    return
+                except BadRequest:
+                    pass
+
     await _send_or_edit(
         update,
         text,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "⌨️ Run another",
-                        callback_data=_cb("exec", "s", server_id),
-                    )
-                ],
-                [back_btn],
-            ]
-        ),
+        reply_markup=session_markup,
         prefer_new=True,
+        parse_mode=parse_mode,
     )
 
 
@@ -1768,17 +2041,20 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if action == "exec":
         if not _is_admin(update):
-            _clear_awaiting(context)
+            _leave_exec_session(context, _chat_id(update))
             return
         server_id = extra.get("server_id")
         if not server_id:
-            _clear_awaiting(context)
+            _leave_exec_session(context, _chat_id(update))
             await update.message.reply_text("No server selected.")
             return
         if not text:
-            await update.message.reply_text("Send a non-empty command.")
+            await update.message.reply_text(
+                "Send a non-empty command.",
+                reply_markup=_exec_session_keyboard(server_id),
+            )
             return
-        _clear_awaiting(context)
+        # Keep awaiting so the user can send the next command after this one.
         await _run_exec_for_admin(update, context, server_id, text)
         return
 
@@ -1988,6 +2264,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if action == "pick" and len(parts) > 1:
+        _leave_exec_session(context, _chat_id(update))
         await _pick_server(update, parts[1])
         return
 
@@ -2001,9 +2278,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         if len(parts) > 2 and parts[1] == "s":
             await _prompt_exec_command(update, context, parts[2])
-        else:
-            _clear_awaiting(context)
-            await _show_servers(update)
+            return
+        if len(parts) > 2 and parts[1] == "stop":
+            server_id = parts[2]
+            chat_id = _chat_id(update)
+            active = _active_execs.get(chat_id) if chat_id is not None else None
+            if active is not None:
+                logger.info("Stop: Ctrl+C for chat %s on %s", chat_id, server_id)
+                active.interrupt()
+                await query.answer("Ctrl+C sent")
+                return
+            # Idle: leave the shell session.
+            logger.info("Stop: no running command; closing session for chat %s", chat_id)
+            _leave_exec_session(context, chat_id, interrupt=False)
+            await query.answer("Session closed")
+            await _show_server_actions(update, server_id)
+            return
+        if len(parts) > 2 and parts[1] == "back":
+            server_id = parts[2]
+            _leave_exec_session(context, _chat_id(update))
+            await query.answer()
+            await _show_server_actions(update, server_id)
+            return
+        _leave_exec_session(context, _chat_id(update))
+        await _show_servers(update)
         return
 
     if action == "al":
@@ -2076,7 +2374,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _clear_awaiting(context)
+    _leave_exec_session(context, _chat_id(update))
     if not _authorized(update):
         await _send_or_edit(
             update,
@@ -2288,7 +2586,13 @@ def main() -> None:
             "Set ADMIN_CHAT_IDS or ALLOWED_CHAT_IDS in .env (comma-separated chat IDs)"
         )
 
-    application = Application.builder().token(token).post_init(post_init).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
