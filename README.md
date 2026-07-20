@@ -80,16 +80,22 @@ Open your bot in Telegram and send `/start` (or `/help`).
 | **Status** | Resource snapshot for your selected server |
 | **All servers** | Short status for every monitored host |
 | **Servers** | Pick a server, then view status (admins can also run commands if enabled) |
-| **Settings** | Per-server CPU / RAM / disk alerts and global check timing |
+| **Settings** | Alerts; admins also get Users, Manage servers, and Update |
 | **My ID** | Your Telegram chat ID |
 | **Backup path** | Admin only — zip a local path or Linux logs and send to Telegram |
+
+Under **Settings**:
+
+| Button | What it does |
+|--------|----------------|
+| **Alerts** | Per-server CPU / RAM / disk alerts and global check timing |
 | **Users** | Admin only — allow or remove users |
 | **Manage servers** | Admin only — add, rename, or remove remote agents |
 | **Update** | Admin only — update the bot server, then all agents |
 
 ### Add a remote server (admin)
 
-1. **Manage servers** → **Add server**
+1. **Settings** → **Manage servers** → **Add server**
 2. Send: `name | url | token`
 
 Example:
@@ -103,13 +109,13 @@ The token must match the agent’s `AGENT_TOKEN`. If you omit the token, one is 
 ### Authorize another user (admin)
 
 1. They send `/start` and tap **My ID**, then send you the number.
-2. **Users** → **Add user** → paste their chat ID.
+2. **Settings** → **Users** → **Add user** → paste their chat ID.
 
 Admins (`ADMIN_CHAT_IDS`) always have full access. Allowed users can view status and settings; only admins manage users, servers, backups, and remote commands.
 
 ### Alerts
 
-Under **Settings**, pick a server and toggle CPU / RAM / disk alerts, thresholds, and (for CPU) how many consecutive checks must stay high before alerting. **Global timing** sets how often to check and the cooldown between repeated alerts.
+Under **Settings** → **Alerts**, pick a server and toggle CPU / RAM / disk alerts, thresholds, and (for CPU) how many consecutive checks must stay high before alerting. **Global timing** sets how often to check and the cooldown between repeated alerts.
 
 Alerts are sent to admin and allowed-user chats when a threshold is exceeded.
 
@@ -135,7 +141,7 @@ Interactive editors (`nano`, `vim`, `top`, …) are blocked — edit files with 
 
 ### From the bot (recommended)
 
-Admins: **Update** in the main menu. The bot checks GitHub for a newer commit than what's installed:
+Admins: **Settings** → **Update**. The bot checks GitHub for a newer commit than what's installed:
 
 - **Update available** — shows the new commit titles, then **Yes, update** / **No**.
 - **Up to date** — offers **Check again** (or **Force update anyway** if you want to reinstall/restart regardless).

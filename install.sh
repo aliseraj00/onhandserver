@@ -684,7 +684,7 @@ if [[ "$INSTALL_MODE" == "agent" ]]; then
     if [[ -n "${AGENT_TOKEN:-}" && "$UPGRADE_MODE" == false && "$should_write_env" == true ]]; then
         echo ""
         echo "Agent token: ${AGENT_TOKEN}"
-        echo "Register in bot: Manage servers → Add server"
+        echo "Register in bot: Settings → Manage servers → Add server"
         echo "  name | http://<this-ip>:${AGENT_PORT:-8765} | ${AGENT_TOKEN}"
         echo "Firewall: allow port ${AGENT_PORT:-8765} only from your bot server's IP."
     fi

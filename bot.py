@@ -297,7 +297,7 @@ async def _fetch_status(server_id: str) -> ResourceSnapshot:
     url = entry.get("url", "").strip()
     if not url:
         raise RemoteAgentError(
-            f"{entry['name']} has no URL — remove it in Admin → Manage servers and re-add"
+            f"{entry['name']} has no URL — remove it in Settings → Manage servers and re-add"
         )
     return await fetch_remote_status(url, entry["token"])
 
@@ -717,6 +717,14 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
             2,
             [InlineKeyboardButton("📦 Backup path", callback_data=_cb("bk"))],
         )
+    return InlineKeyboardMarkup(rows)
+
+
+def _settings_keyboard(update: Update) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("🔔 Alerts", callback_data=_cb("settings", "al"))],
+    ]
+    if _is_admin(update):
         rows.append(
             [
                 InlineKeyboardButton("👤 Users", callback_data=_cb("admin", "users")),
@@ -728,6 +736,7 @@ def _main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton("🔄 Update", callback_data=_cb("upd"))]
         )
+    rows.append([_back_button()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -807,7 +816,7 @@ def _alert_server_picker_keyboard() -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton("⏱ Global timing", callback_data=_cb("al", "g"))]
     )
-    rows.append([_back_button()])
+    rows.append([_back_button("settings")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -856,7 +865,7 @@ def _server_alert_keyboard(server_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "◀️ Servers", callback_data=_cb("al")
                 ),
-                _back_button(),
+                _back_button("settings"),
             ],
         ]
     )
@@ -1059,7 +1068,7 @@ def _admin_servers_keyboard() -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton("➕ Add server", callback_data=_cb("admin", "addsrv"))]
     )
-    rows.append([_back_button()])
+    rows.append([_back_button("settings")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1077,7 +1086,7 @@ def _admin_users_keyboard() -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton("➕ Add user", callback_data=_cb("admin", "adduser"))]
     )
-    rows.append([_back_button()])
+    rows.append([_back_button("settings")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1297,6 +1306,19 @@ async def _show_settings(update: Update) -> None:
     if not _authorized(update):
         await _deny(update)
         return
+    text = "⚙️ Settings\n\nConfigure alerts"
+    if _is_admin(update):
+        text += ", users, servers, and updates"
+    text += "."
+    await _send_or_edit(
+        update,
+        text,
+        reply_markup=_settings_keyboard(update),
+    )
+
+
+async def _open_alerts(update: Update) -> None:
+    """Open alert UI: single-server shortcut, otherwise the server picker."""
     targets = _monitor_target_ids()
     if len(targets) == 1:
         await _show_server_alerts(update, targets[0])
@@ -1817,7 +1839,7 @@ async def _handle_alert_callback(
 
     if not parts:
         # Always show the server list — used by the "◀️ Servers" button.
-        # Do not call _show_settings() here: with one server that shortcuts
+        # Do not call _open_alerts() here: with one server that shortcuts
         # back to the same alert screen and looks broken.
         await _show_alert_picker(update)
         return
@@ -2153,7 +2175,7 @@ def _update_check_keyboard(check: dict) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton("✅ Yes, update", callback_data=_cb("upd", "go")),
-                InlineKeyboardButton("❌ No", callback_data=_cb("menu")),
+                InlineKeyboardButton("❌ No", callback_data=_cb("settings")),
             ]
         )
         rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=_cb("upd"))])
@@ -2166,7 +2188,7 @@ def _update_check_keyboard(check: dict) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    rows.append([_back_button()])
+    rows.append([_back_button("settings")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2174,7 +2196,7 @@ def _update_progress_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔄 Check again", callback_data=_cb("upd"))],
-            [_back_button()],
+            [_back_button("settings")],
         ]
     )
 
@@ -2591,6 +2613,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if action == "settings":
+        if len(parts) > 1 and parts[1] == "al":
+            await _open_alerts(update)
+            return
         await _show_settings(update)
         return
 
